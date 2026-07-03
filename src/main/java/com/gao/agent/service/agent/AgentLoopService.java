@@ -1,5 +1,6 @@
 package com.gao.agent.service.agent;
 
+import java.io.IOException;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
@@ -9,11 +10,13 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.stereotype.Service;
+import org.springframework.web.servlet.mvc.method.annotation.SseEmitter;
 
 import com.gao.agent.model.AgentAction;
 import com.gao.agent.model.AgentLoopResult;
 import com.gao.agent.model.AgentSession;
 import com.gao.agent.model.AgentStepResult;
+import com.gao.agent.model.AgentStreamEvent;
 import com.gao.agent.model.BrowserState;
 import com.gao.agent.service.llm.LargeModelService;
 
@@ -38,16 +41,22 @@ public class AgentLoopService {
     }
 
     public AgentLoopResult run(WebDriver driver, String targetUrl, String taskDescription) {
+        return run(driver, targetUrl, taskDescription, null, null);
+    }
+
+    public AgentLoopResult run(WebDriver driver, String targetUrl, String taskDescription, String taskId, SseEmitter emitter) {
         List<AgentStepResult> steps = new ArrayList<>();
         List<Map<String, String>> history = new ArrayList<>();
         history.add(Map.of("role", "system", "content", SYSTEM_PROMPT));
 
         try {
+            sendSse(emitter, AgentStreamEvent.thinking(taskId, 0, "任务开始，正在打开页面..."));
             BrowserState state = pageStateService.getBrowserState(driver);
             history.add(Map.of("role", "user", "content", buildFirstUserMsg(targetUrl, taskDescription, state)));
-            return runLoop(driver, history, state, steps, 1);
+            return runLoop(driver, history, state, steps, 1, taskId, emitter);
         } catch (Exception e) {
             log.error("Agent loop crashed", e);
+            sendSse(emitter, AgentStreamEvent.error(taskId, -1, "异常: " + e.getMessage()));
             AgentLoopResult result = new AgentLoopResult();
             result.setSuccess(false);
             result.setMessage("异常: " + e.getMessage());
@@ -66,6 +75,10 @@ public class AgentLoopService {
     }
 
     public AgentLoopResult resumeFromSession(AgentSession session) {
+        return resumeFromSession(session, null);
+    }
+
+    public AgentLoopResult resumeFromSession(AgentSession session, SseEmitter emitter) {
         String userInput = session.getUserInput();
         log.info("Resuming agent loop with user input: {}", userInput);
 
@@ -73,6 +86,7 @@ public class AgentLoopService {
         List<AgentStepResult> steps = new ArrayList<>(session.getSteps());
         WebDriver driver = session.getDriver();
         BrowserState state = session.getLastState();
+        String taskId = session.getTaskId();
 
         history.add(Map.of("role", "user", "content",
                 "用户提供了以下信息：\n" + userInput +
@@ -84,9 +98,11 @@ public class AgentLoopService {
                 "\n\n请继续决定下一步操作。返回 JSON 格式。"));
 
         try {
-            return runLoop(driver, history, state, steps, session.getStepCount() + 1);
+            sendSse(emitter, AgentStreamEvent.thinking(taskId, steps.size() + 1, "收到用户输入，正在恢复执行..."));
+            return runLoop(driver, history, state, steps, steps.size() + 1, taskId, emitter);
         } catch (Exception e) {
             log.error("Agent loop resume crashed", e);
+            sendSse(emitter, AgentStreamEvent.error(taskId, -1, "恢复执行异常: " + e.getMessage()));
             AgentLoopResult result = new AgentLoopResult();
             result.setSuccess(false);
             result.setMessage("恢复执行异常: " + e.getMessage());
@@ -97,15 +113,17 @@ public class AgentLoopService {
 
     private AgentLoopResult runLoop(WebDriver driver, List<Map<String, String>> history,
                                      BrowserState state, List<AgentStepResult> steps,
-                                     int startStep) {
+                                     int startStep, String taskId, SseEmitter emitter) {
         for (int step = startStep; step <= maxSteps; step++) {
             log.info("━━━ Agent Loop Step {}/{} ━━━", step, maxSteps);
+            sendSse(emitter, AgentStreamEvent.thinking(taskId, step, "正在分析页面状态..."));
 
             AgentAction action;
             try {
                 action = llmService.decideNextAction(history);
             } catch (Exception e) {
                 log.error("LLM failed at step {}", step, e);
+                sendSse(emitter, AgentStreamEvent.error(taskId, step, "LLM调用失败: " + e.getMessage()));
                 AgentLoopResult result = new AgentLoopResult();
                 result.setSuccess(false);
                 result.setMessage("LLM调用失败: " + e.getMessage());
@@ -113,6 +131,7 @@ public class AgentLoopService {
                 return result;
             }
             log.info("LLM → action={}, index={}, text={}", action.getAction(), action.getIndex(), action.getText());
+            sendSse(emitter, AgentStreamEvent.thinking(taskId, step, action.getThinking() != null ? action.getThinking() : "正在决定下一步操作..."));
 
             AgentStepResult sr = new AgentStepResult();
             sr.setStepNumber(step);
@@ -121,11 +140,15 @@ public class AgentLoopService {
             sr.setScreenshot(executor.screenshot(driver));
 
             if (action.getAction() == AgentAction.ActionType.done) {
-                AgentLoopResult doneResult = handleDone(action, sr, steps);
+                AgentLoopResult doneResult = handleDone(action, sr, steps, taskId, emitter);
                 if (doneResult != null) {
                     doneResult.setTotalSteps(step);
                     doneResult.setConversationHistory(new ArrayList<>(history));
                     doneResult.setLastBrowserState(state);
+                    if (doneResult.getNeedsInputPrompt() != null) {
+                        return doneResult;
+                    }
+                    sendSse(emitter, AgentStreamEvent.done(taskId, doneResult.isSuccess(), doneResult.getMessage()));
                     return doneResult;
                 }
                 continue;
@@ -134,8 +157,9 @@ public class AgentLoopService {
             if (action.getAction() == AgentAction.ActionType.needs_input) {
                 String prompt = action.getSummary() != null ? action.getSummary() : "需要用户输入";
                 log.info("Agent needs user input: {}", prompt);
+                sendSse(emitter, AgentStreamEvent.needsInput(taskId, step, prompt));
                 sr.setSuccess(false);
-                sr.setMessage("⏸ 等待用户输入: " + prompt);
+                sr.setMessage(" 等待用户输入: " + prompt);
                 steps.add(sr);
 
                 AgentLoopResult result = new AgentLoopResult();
@@ -149,10 +173,15 @@ public class AgentLoopService {
                 return result;
             }
 
+            String actionDesc = buildActionDescription(action);
+            sendSse(emitter, AgentStreamEvent.actionStart(taskId, step, action.getAction().name(), action.getIndex(), actionDesc));
+            
             ActionExecutor.ActionResult ar = execute(driver, action, state);
             sr.setSuccess(ar.success());
             sr.setMessage(ar.message());
             steps.add(sr);
+
+            sendSse(emitter, AgentStreamEvent.actionComplete(taskId, step, ar.success(), ar.message()));
 
             try { Thread.sleep(waitMs); } catch (InterruptedException e) { Thread.currentThread().interrupt(); break; }
 
@@ -171,10 +200,37 @@ public class AgentLoopService {
         result.setSteps(steps);
         result.setConversationHistory(new ArrayList<>(history));
         result.setLastBrowserState(state);
+        sendSse(emitter, AgentStreamEvent.done(taskId, false, result.getMessage()));
         return result;
     }
 
-    private AgentLoopResult handleDone(AgentAction action, AgentStepResult sr, List<AgentStepResult> steps) {
+    private String buildActionDescription(AgentAction action) {
+        StringBuilder sb = new StringBuilder();
+        sb.append(action.getAction().name());
+        if (action.getIndex() != null) {
+            sb.append(" [").append(action.getIndex()).append("]");
+        }
+        if (action.getText() != null && !action.getText().isEmpty()) {
+            sb.append(": ").append(action.getText());
+        }
+        return sb.toString();
+    }
+
+    private void sendSse(SseEmitter emitter, AgentStreamEvent event) {
+        if (emitter != null && event != null) {
+            try {
+                log.info("Sending SSE event: type={}, step={}, content={}", event.type(), event.step(), event.content());
+                emitter.send(SseEmitter.event().name(event.type()).data(event));
+                log.info("SSE event sent successfully: type={}", event.type());
+            } catch (IOException e) {
+                log.warn("Failed to send SSE event: type={}, error={}", event.type(), e.getMessage());
+            }
+        } else {
+            log.warn("Cannot send SSE event: emitter={}, event={}", emitter == null ? "null" : "valid", event == null ? "null" : "valid");
+        }
+    }
+
+    private AgentLoopResult handleDone(AgentAction action, AgentStepResult sr, List<AgentStepResult> steps, String taskId, SseEmitter emitter) {
         boolean taskSuccess = inferSuccess(action);
 
         if (!taskSuccess && shouldAskForUserInput(action)) {
@@ -188,6 +244,8 @@ public class AgentLoopService {
             sr.setSuccess(false);
             sr.setMessage("⏸ 等待用户输入: " + prompt);
             steps.add(sr);
+
+            sendSse(emitter, AgentStreamEvent.needsInput(taskId, steps.size(), prompt));
 
             AgentLoopResult result = new AgentLoopResult();
             result.setSuccess(false);

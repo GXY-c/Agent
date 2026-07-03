@@ -2,10 +2,12 @@ package com.gao.agent.model;
 
 import java.util.List;
 import java.util.Map;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
 
 import org.openqa.selenium.WebDriver;
+import org.springframework.web.servlet.mvc.method.annotation.SseEmitter;
 
 public class AgentSession {
     private String taskId;
@@ -18,6 +20,7 @@ public class AgentSession {
     private volatile CountDownLatch latch = new CountDownLatch(1);
     private volatile String userInput;
     private long createdAt = System.currentTimeMillis();
+    private final Map<String, Object> attributes = new ConcurrentHashMap<>();
 
     public AgentSession(String taskId, WebDriver driver,
                         List<Map<String, String>> conversationHistory,
@@ -53,6 +56,22 @@ public class AgentSession {
         this.lastState = result.getLastBrowserState();
         this.conversationHistory = result.getConversationHistory();
         resetForNextInput();
+    }
+
+    public Object getAttribute(String key) {
+        return attributes.get(key);
+    }
+
+    public void setAttribute(String key, Object value) {
+        attributes.put(key, value);
+    }
+
+    public SseEmitter getEmitter() {
+        return (SseEmitter) attributes.get("emitter");
+    }
+
+    public void setEmitter(SseEmitter emitter) {
+        attributes.put("emitter", emitter);
     }
 
     public String getTaskId() { return taskId; }

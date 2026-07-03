@@ -3,30 +3,30 @@
     <header>
       <div>
         <h1>🤖 AgentRunner - 自动化测试执行器</h1>
-        <p>左侧配置任务，右侧查看执行结果。Selenium 将打开独立浏览器窗口执行操作。</p>
+        <p>左侧配置任务，右侧实时查看 AI 思考过程和操作步骤。Selenium 将打开独立浏览器窗口执行操作。</p>
       </div>
     </header>
 
     <main>
       <section class="left-panel">
         <div class="config-card">
-          <h2>⚙️ 任务配置</h2>
+          <h2>️ 任务配置</h2>
 
           <div class="form-group">
             <label for="targetUrl">目标页面 URL</label>
             <input
-              v-model="targetUrl"
-              placeholder="例如：http://localhost:5173/login"
-              type="url"
+                v-model="targetUrl"
+                placeholder="例如：http://localhost:5173/login"
+                type="url"
             />
           </div>
 
           <div class="form-group">
             <label for="taskDescription">任务描述（自然语言）</label>
             <textarea
-              v-model="taskDescription"
-              rows="6"
-              placeholder="例如：打开登录页面，输入用户名 test，密码 123456，点击登录按钮"
+                v-model="taskDescription"
+                rows="6"
+                placeholder="例如：打开登录页面，输入用户名 test，密码 123456，点击登录按钮"
             ></textarea>
           </div>
 
@@ -56,73 +56,64 @@
       </section>
 
       <section class="right-panel">
-        <div class="result-header">
-          <h2>📊 执行结果</h2>
-          <span v-if="status" class="status-badge" :class="statusClass">{{ statusText }}</span>
-        </div>
-
-        <div v-if="resultSummary" class="result-summary" :class="summaryClass">
-          <strong>{{ resultSummary.title }}</strong><br/>
-          <small>{{ resultSummary.message }}</small>
-        </div>
-
-        <div v-if="isWaitingInput" class="waiting-input-card">
-          <h3>⏸️ {{ needsInputPrompt || '需要您的输入' }}</h3>
-          <p class="waiting-hint">浏览器窗口保持打开中，请输入信息后点击提交继续执行。</p>
-          <textarea
-            v-model="userInputText"
-            rows="3"
-            placeholder="例如：验证码是 Ab3d，或者输入其他补充信息..."
-          ></textarea>
-          <div class="waiting-buttons">
-            <button @click="resumeTask" class="btn-resume">
-              ▶️ 提交并继续
-            </button>
-            <button @click="cancelTask" class="btn-cancel">
-              ❌ 取消任务
-            </button>
+        <div class="chat-panel-full">
+          <div class="chat-header">
+            <h2> AI 思考过程</h2>
+            <span v-if="status" class="status-badge" :class="statusClass">{{ statusText }}</span>
           </div>
-        </div>
 
-        <div v-if="browserInfo" class="browser-info">
-          浏览器: {{ browserInfo.browser }} | 可视化: {{ browserInfo.visual ? '是' : '否' }}
-        </div>
-
-        <h3 class="steps-title">执行步骤</h3>
-
-        <div v-if="steps.length === 0 && !isRunning" class="empty-state">
-          <p>等待执行测试...</p>
-        </div>
-
-        <div v-else-if="isRunning && steps.length === 0" class="loading-state">
-          <div class="spinner"></div>
-          <p>正在生成测试计划并执行...</p>
-        </div>
-
-        <div v-else class="execution-log">
-          <div
-            v-for="(step, index) in steps"
-            :key="index"
-            class="log-entry"
-            :class="{ success: step.success, error: !step.success }"
-          >
-            <div class="log-header">
-              <span class="log-title">{{ index + 1 }}. {{ step.description || step.actionType }}</span>
-              <span class="log-status" :class="{ success: step.success, failed: !step.success }">
-                {{ step.success ? '✓ 成功' : '✗ 失败' }}
-              </span>
+          <div ref="chatContainer" class="chat-messages">
+            <div v-if="steps.length === 0 && !isRunning" class="empty-state">
+              <p>等待执行测试...</p>
             </div>
 
-            <div v-if="step.details" class="log-details">
-              详情: {{ step.details }}
+            <div v-else-if="isRunning && steps.length === 0" class="loading-state">
+              <div class="spinner"></div>
+              <p>正在生成测试计划并执行...</p>
             </div>
 
-            <div v-if="step.errorMessage" class="log-details error-text">
-              错误: {{ step.errorMessage }}
+            <div v-else class="messages-list">
+              <div
+                  v-for="(step, index) in steps"
+                  :key="index"
+                  class="message-item"
+                  :class="{ thinking: step.type === 'thinking', action: step.type === 'action', result: step.type === 'result', needsInput: step.type === 'needs_input', done: step.type === 'done', error: step.type === 'error' }"
+              >
+                <div class="message-icon">
+                  <span v-if="step.type === 'thinking'">🧠</span>
+                  <span v-else-if="step.type === 'action'">⚡</span>
+                  <span v-else-if="step.type === 'result'">✅</span>
+                  <span v-else-if="step.type === 'needs_input'">⏸️</span>
+                  <span v-else-if="step.type === 'done'"></span>
+                  <span v-else-if="step.type === 'error'">❌</span>
+                </div>
+                <div class="message-content">
+                  <div class="message-header">
+                    <span class="message-type">{{ formatMessageType(step.type) }}</span>
+                    <span v-if="step.step" class="message-step">第 {{ step.step }} 步</span>
+                  </div>
+                  <div class="message-text">{{ step.content }}</div>
+                  <div v-if="step.details" class="message-details">{{ step.details }}</div>
+                </div>
+              </div>
             </div>
+          </div>
 
-            <div v-if="step.screenshotBase64 || step.screenshot" class="screenshot-container">
-              <img :src="step.screenshotBase64 || step.screenshot" alt="步骤截图" />
+          <div v-if="isWaitingInput" class="waiting-input-card">
+            <h3>⏸️ {{ needsInputPrompt || '需要您的输入' }}</h3>
+            <p class="waiting-hint">浏览器窗口保持打开中，请输入信息后点击提交继续执行。</p>
+            <textarea
+                v-model="userInputText"
+                rows="3"
+                placeholder="例如：验证码是 Ab3d，或者输入其他补充信息..."
+            ></textarea>
+            <div class="waiting-buttons">
+              <button @click="resumeTask" class="btn-resume">
+                ▶️ 提交并继续
+              </button>
+              <button @click="cancelTask" class="btn-cancel">
+                ❌ 取消任务
+              </button>
             </div>
           </div>
         </div>
@@ -132,7 +123,7 @@
 </template>
 
 <script setup>
-import { ref, computed } from 'vue';
+import { ref, computed, nextTick, onUnmounted } from 'vue';
 import axios from 'axios';
 
 const targetUrl = ref('http://localhost:5173/login');
@@ -146,7 +137,9 @@ const steps = ref([]);
 const polling = ref(false);
 const needsInputPrompt = ref('');
 const userInputText = ref('');
+const chatContainer = ref(null);
 let pollInterval = null;
+let eventSource = null;
 
 const isRunning = computed(() => status.value === 'RUNNING' || status.value === 'PENDING');
 const isWaitingInput = computed(() => status.value === 'WAITING_INPUT');
@@ -160,36 +153,27 @@ const statusClass = computed(() => {
 
 const statusText = computed(() => {
   const map = {
-    'PENDING': '⏳ 等待中',
+    'PENDING': ' 等待中',
     'RUNNING': '🔄 执行中',
     'SUCCESS': '✅ 成功',
-    'FAILED': '❌ 失败',
-    'ERROR': '⚠️ 错误',
+    'FAILED': ' 失败',
+    'ERROR': '️ 错误',
     'WAITING_INPUT': '⏸️ 等待输入'
   };
   return map[status.value] || status.value;
 });
 
-const resultSummary = computed(() => {
-  if (!taskMessage.value) return null;
-  if (status.value === 'WAITING_INPUT') return null;
-  return {
-    title: status.value === 'SUCCESS' ? '✅ 测试通过' : '❌ 测试失败',
-    message: taskMessage.value
+function formatMessageType(type) {
+  const map = {
+    'thinking': ' AI 思考',
+    'action': '⚡ 执行操作',
+    'result': '✅ 操作结果',
+    'needs_input': '⏸️ 等待输入',
+    'done': '🎉 完成',
+    'error': '❌ 错误'
   };
-});
-
-const summaryClass = computed(() => {
-  return status.value === 'SUCCESS' ? 'success' : 'failed';
-});
-
-const browserInfo = computed(() => {
-  if (!steps.value.length) return null;
-  return {
-    browser: browser.value === 'EDGE' ? 'Microsoft Edge' : 'Google Chrome',
-    visual: visual.value
-  };
-});
+  return map[type] || type;
+}
 
 async function submitTask() {
   if (!targetUrl.value || !taskDescription.value) {
@@ -216,7 +200,7 @@ async function submitTask() {
 
     if (response.data.taskId) {
       taskId.value = response.data.taskId;
-      startPolling(taskId.value);
+      connectToStream(taskId.value);
     } else {
       showError(response.data.message || '请求失败');
     }
@@ -226,21 +210,198 @@ async function submitTask() {
   }
 }
 
+function connectToStream(taskId) {
+  if (eventSource) {
+    console.log('Closing existing SSE connection');
+    eventSource.close();
+  }
+
+  console.log('Creating new SSE connection for task:', taskId);
+  eventSource = new EventSource(`/api/automation/tasks/${taskId}/stream`);
+
+  console.log('SSE connection established for task:', taskId);
+
+  eventSource.addEventListener('thinking', (event) => {
+    const data = JSON.parse(event.data);
+    console.log('✅ Received thinking event:', data);
+    addThinkingStep(data);
+  });
+
+  eventSource.addEventListener('action_start', (event) => {
+    const data = JSON.parse(event.data);
+    console.log('✅ Received action_start event:', data);
+    addActionStep(data);
+  });
+
+  eventSource.addEventListener('action_complete', (event) => {
+    const data = JSON.parse(event.data);
+    console.log('✅ Received action_complete event:', data);
+    updateLastStepResult(data);
+  });
+
+  eventSource.addEventListener('needs_input', (event) => {
+    const data = JSON.parse(event.data);
+    console.log('✅ Received needs_input event:', data);
+    addNeedsInputStep(data);
+  });
+
+  eventSource.addEventListener('done', (event) => {
+    const data = JSON.parse(event.data);
+    console.log('✅ Received done event:', data);
+    addDoneStep(data);
+  });
+
+  eventSource.addEventListener('error', (event) => {
+    const data = JSON.parse(event.data);
+    console.log('✅ Received error event:', data);
+    addErrorStep(data);
+  });
+
+  eventSource.onerror = (err) => {
+    console.error('❌ SSE connection error:', err);
+    console.error('ReadyState:', eventSource.readyState);
+    eventSource.close();
+  };
+
+  // 监听连接打开事件
+  eventSource.onopen = () => {
+    console.log('🔓 SSE connection opened successfully');
+  };
+}
+
+function addThinkingStep(data) {
+  const lastStep = steps.value[steps.value.length - 1];
+  if (lastStep && lastStep.type === 'thinking' && lastStep.step === data.step) {
+    lastStep.content += '\n' + data.content;
+  } else {
+    steps.value.push({
+      type: 'thinking',
+      step: data.step,
+      content: data.content,
+      timestamp: Date.now()
+    });
+  }
+  scrollToBottom();
+}
+
+function addActionStep(data) {
+  steps.value.push({
+    type: 'action',
+    step: data.step,
+    content: data.content || `${data.action} [${data.index}]`,
+    details: data.description,
+    timestamp: Date.now()
+  });
+  scrollToBottom();
+}
+
+function updateLastStepResult(data) {
+  const lastStep = steps.value[steps.value.length - 1];
+  if (lastStep && lastStep.type === 'action') {
+    lastStep.type = 'result';
+    lastStep.content = data.content;
+    lastStep.success = data.success;
+  }
+  scrollToBottom();
+}
+
+function addNeedsInputStep(data) {
+  console.log('Adding needs_input step:', data);
+  steps.value.push({
+    type: 'needs_input',
+    step: data.step,
+    content: data.content,
+    timestamp: Date.now()
+  });
+  status.value = 'WAITING_INPUT';
+  needsInputPrompt.value = data.content;
+  console.log('Current status:', status.value, 'needsInputPrompt:', needsInputPrompt.value);
+
+  // 关闭当前的 SSE 连接，防止接收后续事件
+  if (eventSource) {
+    console.log('Closing SSE connection after needs_input');
+    eventSource.close();
+    eventSource = null;
+  }
+
+  scrollToBottom();
+}
+
+function addDoneStep(data) {
+  steps.value.push({
+    type: 'done',
+    step: data.step,
+    content: data.content,
+    success: data.success,
+    timestamp: Date.now()
+  });
+  status.value = data.success ? 'SUCCESS' : 'FAILED';
+  taskMessage.value = data.content;
+  stopPolling();
+  if (eventSource) {
+    eventSource.close();
+  }
+  document.querySelector('.left-panel button').disabled = false;
+  scrollToBottom();
+}
+
+function addErrorStep(data) {
+  steps.value.push({
+    type: 'error',
+    step: data.step,
+    content: data.content,
+    timestamp: Date.now()
+  });
+  status.value = 'ERROR';
+  taskMessage.value = data.content;
+  stopPolling();
+  if (eventSource) {
+    eventSource.close();
+  }
+  document.querySelector('.left-panel button').disabled = false;
+  scrollToBottom();
+}
+
+function scrollToBottom() {
+  nextTick(() => {
+    if (chatContainer.value) {
+      chatContainer.value.scrollTop = chatContainer.value.scrollHeight;
+    }
+  });
+}
+
 async function resumeTask() {
   if (!userInputText.value.trim()) {
     alert('请输入信息后再提交');
     return;
   }
   try {
+    console.log('🔄 Starting resume process...');
+    console.log('User input:', userInputText.value);
+
+    // 先重新建立 SSE 连接，确保恢复执行时有有效的 emitter
+    console.log(' Re-establishing SSE connection before resuming...');
+    connectToStream(taskId.value);
+
+    // 等待一小段时间让 SSE 连接建立完成
+    await new Promise(resolve => setTimeout(resolve, 500));
+    console.log('⏳ SSE connection should be ready now');
+
+    // 然后提交用户输入
+    console.log('📤 Calling resume API...');
     const response = await axios.post(`/api/automation/tasks/${taskId.value}/resume`, {
       input: userInputText.value
     });
+    console.log('✅ Resume API response:', response.data);
+
     userInputText.value = '';
     status.value = 'RUNNING';
     taskMessage.value = '正在恢复执行...';
-    startPolling(taskId.value);
+    needsInputPrompt.value = '';
+
+    console.log(' Task resumed, waiting for SSE events...');
   } catch (error) {
-    console.error('Resume error:', error);
+    console.error(' Resume error:', error);
     alert(error.response?.data?.error || '恢复失败');
   }
 }
@@ -252,52 +413,13 @@ async function cancelTask() {
     taskMessage.value = '用户取消了任务';
     needsInputPrompt.value = '';
     stopPolling();
+    if (eventSource) {
+      eventSource.close();
+    }
     document.querySelector('.left-panel button').disabled = false;
   } catch (error) {
     console.error('Cancel error:', error);
   }
-}
-
-function startPolling(id) {
-  if (pollInterval) {
-    clearInterval(pollInterval);
-  }
-
-  pollInterval = setInterval(async () => {
-    try {
-      const response = await axios.get(`/api/automation/tasks/${id}`);
-
-      if (response.data) {
-        const data = response.data;
-        const executionResult = data.result || {};
-
-        console.log('Polling response:', {
-          status: data.status,
-          statusType: typeof data.status,
-          needsInputPrompt: data.needsInputPrompt,
-          stepsCount: executionResult.steps?.length || 0
-        });
-
-        status.value = data.status || 'RUNNING';
-        taskMessage.value = executionResult.message || '';
-        steps.value = executionResult.steps || [];
-
-        if (data.needsInputPrompt) {
-          needsInputPrompt.value = data.needsInputPrompt;
-        }
-
-        if (data.status === 'WAITING_INPUT') {
-          document.querySelector('.left-panel button').disabled = false;
-        } else if (data.status === 'SUCCESS' || data.status === 'FAILED') {
-          clearInterval(pollInterval);
-          pollInterval = null;
-          document.querySelector('.left-panel button').disabled = false;
-        }
-      }
-    } catch (error) {
-      console.error('Polling error:', error);
-    }
-  }, 1000);
 }
 
 function stopPolling() {
@@ -307,13 +429,20 @@ function stopPolling() {
   }
 }
 
+onUnmounted(() => {
+  if (eventSource) {
+    eventSource.close();
+  }
+  stopPolling();
+});
+
 function showError(message) {
   status.value = 'ERROR';
   taskMessage.value = message;
   steps.value = [{
-    description: '错误',
-    success: false,
-    details: message
+    type: 'error',
+    content: message,
+    timestamp: Date.now()
   }];
   document.querySelector('.left-panel button').disabled = false;
 }
@@ -477,17 +606,25 @@ button:disabled {
   word-break: break-all;
 }
 
-.result-header {
+.chat-panel-full {
+  display: flex;
+  flex-direction: column;
+  height: calc(100vh - 280px);
+}
+
+.chat-header {
   display: flex;
   justify-content: space-between;
   align-items: center;
-  margin-bottom: 16px;
+  padding: 12px 16px;
+  background: #f8fafc;
+  border-bottom: 1px solid #e0e0e0;
 }
 
-.result-header h2 {
+.chat-header h2 {
   margin: 0;
   color: var(--text);
-  font-size: 20px;
+  font-size: 18px;
 }
 
 .status-badge {
@@ -513,32 +650,11 @@ button:disabled {
   50% { opacity: 0.6; }
 }
 
-.result-summary {
+.chat-messages {
+  flex: 1;
+  overflow-y: auto;
   padding: 16px;
-  border-radius: 8px;
-  margin-bottom: 16px;
-}
-
-.result-summary.success {
-  background: #d4edda;
-  border: 2px solid var(--success);
-}
-
-.result-summary.failed {
-  background: #f8d7da;
-  border: 2px solid var(--danger);
-}
-
-.browser-info {
-  font-size: 12px;
-  color: var(--muted);
-  margin-bottom: 16px;
-}
-
-.steps-title {
-  margin: 20px 0 12px;
-  color: var(--text);
-  font-size: 18px;
+  background: #fafafa;
 }
 
 .empty-state,
@@ -562,75 +678,107 @@ button:disabled {
   to { transform: rotate(360deg); }
 }
 
-.execution-log {
-  max-height: 500px;
-  overflow-y: auto;
+.messages-list {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
 }
 
-.log-entry {
-  padding: 16px;
-  margin-bottom: 12px;
+.message-item {
+  display: flex;
+  gap: 12px;
+  padding: 12px;
   border-radius: 8px;
-  background: #f9f9f9;
+  background: white;
   border-left: 4px solid var(--accent);
+  animation: fadeIn 0.3s ease-in;
 }
 
-.log-entry.success {
+@keyframes fadeIn {
+  from {
+    opacity: 0;
+    transform: translateY(-10px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+.message-item.thinking {
+  border-left-color: #8b5cf6;
+  background: #f5f3ff;
+}
+
+.message-item.action {
+  border-left-color: #f59e0b;
+  background: #fef3c7;
+}
+
+.message-item.result {
   border-left-color: var(--success);
+  background: #d1fae5;
 }
 
-.log-entry.error {
+.message-item.needsInput {
+  border-left-color: var(--warning);
+  background: #fef3c7;
+}
+
+.message-item.done {
+  border-left-color: var(--success);
+  background: #d1fae5;
+}
+
+.message-item.error {
   border-left-color: var(--danger);
+  background: #fee2e2;
 }
 
-.log-header {
+.message-icon {
+  font-size: 24px;
+  flex-shrink: 0;
+}
+
+.message-content {
+  flex: 1;
+  min-width: 0;
+}
+
+.message-header {
   display: flex;
   justify-content: space-between;
   align-items: center;
-  margin-bottom: 8px;
+  margin-bottom: 6px;
 }
 
-.log-title {
+.message-type {
   font-weight: 600;
   color: var(--text);
-}
-
-.log-status {
-  font-size: 12px;
-  padding: 4px 8px;
-  border-radius: 4px;
-  font-weight: 600;
-}
-
-.log-status.success {
-  background: #d4edda;
-  color: #155724;
-}
-
-.log-status.failed {
-  background: #f8d7da;
-  color: #721c24;
-}
-
-.log-details {
   font-size: 13px;
+}
+
+.message-step {
+  font-size: 11px;
+  color: var(--muted);
+  background: #f0f0f0;
+  padding: 2px 6px;
+  border-radius: 4px;
+}
+
+.message-text {
+  font-size: 14px;
+  color: var(--text);
+  line-height: 1.5;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
+.message-details {
+  font-size: 12px;
   color: var(--muted);
   margin-top: 4px;
-}
-
-.error-text {
-  color: var(--danger);
-  font-weight: 500;
-}
-
-.screenshot-container {
-  margin-top: 12px;
-}
-
-.screenshot-container img {
-  max-width: 100%;
-  border-radius: 8px;
-  border: 2px solid #e0e0e0;
+  font-style: italic;
 }
 
 .waiting-input-card {
@@ -638,7 +786,7 @@ button:disabled {
   border: 2px solid var(--warning);
   border-radius: 12px;
   padding: 20px;
-  margin-bottom: 16px;
+  margin-top: 16px;
 }
 
 .waiting-input-card h3 {
@@ -713,6 +861,11 @@ button:disabled {
 @media (max-width: 1200px) {
   main {
     grid-template-columns: 1fr;
+  }
+
+  .chat-panel-full {
+    height: auto;
+    min-height: 500px;
   }
 }
 </style>

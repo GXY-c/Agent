@@ -2,6 +2,7 @@ package com.gao.agent.controller;
 
 import java.util.Map;
 
+import org.springframework.http.MediaType;
 import org.springframework.http.ResponseEntity;
 import org.springframework.web.bind.annotation.CrossOrigin;
 import org.springframework.web.bind.annotation.GetMapping;
@@ -10,6 +11,7 @@ import org.springframework.web.bind.annotation.PostMapping;
 import org.springframework.web.bind.annotation.RequestBody;
 import org.springframework.web.bind.annotation.RequestMapping;
 import org.springframework.web.bind.annotation.RestController;
+import org.springframework.web.servlet.mvc.method.annotation.SseEmitter;
 
 import com.gao.agent.model.TaskSubmissionResponse;
 import com.gao.agent.model.TestTaskRequest;
@@ -33,6 +35,13 @@ public class TestAutomationController {
     public ResponseEntity<TaskSubmissionResponse> submitTask(@Valid @RequestBody TestTaskRequest request) {
         TaskSubmissionResponse response = automationService.submitTask(request);
         return ResponseEntity.ok(response);
+    }
+
+    @GetMapping(value = "/tasks/{taskId}/stream", produces = MediaType.TEXT_EVENT_STREAM_VALUE)
+    public SseEmitter streamTaskProgress(@PathVariable String taskId) {
+        SseEmitter emitter = new SseEmitter(300_000L);
+        automationService.registerEmitter(taskId, emitter);
+        return emitter;
     }
 
     @GetMapping("/tasks/{taskId}")

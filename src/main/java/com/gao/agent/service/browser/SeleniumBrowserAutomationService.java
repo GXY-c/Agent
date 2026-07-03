@@ -665,20 +665,40 @@ public class SeleniumBrowserAutomationService implements BrowserAutomationServic
     public AgentLoopResult runAgentLoopWithSession(String targetUrl, String taskDescription,
                                                     String browserName, boolean visual, String taskId,
                                                     AgentLoopCallback callback) {
+        return runAgentLoopWithSse(targetUrl, taskDescription, browserName, visual, taskId, callback, null);
+    }
+
+    public AgentLoopResult runAgentLoopWithSse(String targetUrl, String taskDescription,
+                                                String browserName, boolean visual, String taskId,
+                                                AgentLoopCallback callback,
+                                                org.springframework.web.servlet.mvc.method.annotation.SseEmitter emitter) {
         WebDriver driver = null;
         boolean keepDriverOpen = false;
+        
+        if (emitter == null && taskId != null) {
+            log.warn("Emitter is null for task {}, attempting to retrieve from session", taskId);
+            AgentSession session = activeSessions.get(taskId);
+            if (session != null && session.getEmitter() != null) {
+                emitter = session.getEmitter();
+                log.info("Retrieved emitter from session for task {}", taskId);
+            }
+        }
+        
         try {
             driver = createDriver(browserName, visual);
             driver.manage().timeouts().implicitlyWait(Duration.ofSeconds(5));
             driver.get(targetUrl);
             try { Thread.sleep(2000); } catch (InterruptedException e) { Thread.currentThread().interrupt(); }
 
-            AgentLoopResult loopResult = agentLoopService.run(driver, targetUrl, taskDescription);
+            AgentLoopResult loopResult = agentLoopService.run(driver, targetUrl, taskDescription, taskId, emitter);
 
             if (loopResult.getNeedsInputPrompt() != null && taskId != null) {
                 keepDriverOpen = true;
                 log.info("Agent needs input for task {}, keeping browser open", taskId);
                 AgentSession session = agentLoopService.createSession(taskId, driver, loopResult);
+                if (emitter != null) {
+                    session.setEmitter(emitter);
+                }
                 activeSessions.put(taskId, session);
 
                 if (callback != null) {
@@ -703,7 +723,12 @@ public class SeleniumBrowserAutomationService implements BrowserAutomationServic
                 }
 
                 log.info("User provided input for task {}, resuming", taskId);
-                AgentLoopResult resumeResult = agentLoopService.resumeFromSession(session);
+                
+                // 从 session 获取最新的 emitter（可能在前端重新连接时被更新）
+                org.springframework.web.servlet.mvc.method.annotation.SseEmitter resumeEmitter = session.getEmitter();
+                log.info("Resume emitter from session: {}", resumeEmitter != null ? "valid" : "null");
+                
+                AgentLoopResult resumeResult = agentLoopService.resumeFromSession(session, resumeEmitter);
 
                 while (resumeResult.getNeedsInputPrompt() != null) {
                     log.info("Agent needs more input for task {}", taskId);
@@ -727,7 +752,11 @@ public class SeleniumBrowserAutomationService implements BrowserAutomationServic
                         keepDriverOpen = false;
                         return resumeResult;
                     }
-                    resumeResult = agentLoopService.resumeFromSession(session);
+                    
+                    // 每次恢复执行前都更新 emitter
+                    resumeEmitter = session.getEmitter();
+                    log.info("Resume emitter for next iteration: {}", resumeEmitter != null ? "valid" : "null");
+                    resumeResult = agentLoopService.resumeFromSession(session, resumeEmitter);
                 }
 
                 activeSessions.remove(taskId);

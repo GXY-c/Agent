@@ -9,6 +9,7 @@ import java.util.concurrent.ConcurrentHashMap;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.stereotype.Service;
+import org.springframework.web.servlet.mvc.method.annotation.SseEmitter;
 
 import com.gao.agent.model.AgentLoopResult;
 import com.gao.agent.model.AgentSession;
@@ -31,6 +32,7 @@ public class TestAutomationServiceImpl implements TestAutomationService {
     private final BrowserAutomationService browserAutomationService;
     private final AsyncTaskRunner asyncTaskRunner;
     private final Map<String, TestTaskResponse> taskStore = new ConcurrentHashMap<>();
+    private final Map<String, SseEmitter> emitterStore = new ConcurrentHashMap<>();
 
     public TestAutomationServiceImpl(LargeModelService largeModelService,
                                      BrowserAutomationService browserAutomationService,
@@ -38,6 +40,19 @@ public class TestAutomationServiceImpl implements TestAutomationService {
         this.largeModelService = largeModelService;
         this.browserAutomationService = browserAutomationService;
         this.asyncTaskRunner = asyncTaskRunner;
+    }
+
+    @Override
+    public void registerEmitter(String taskId, SseEmitter emitter) {
+        emitterStore.put(taskId, emitter);
+        emitter.onCompletion(() -> emitterStore.remove(taskId));
+        emitter.onTimeout(() -> emitterStore.remove(taskId));
+        emitter.onError(e -> emitterStore.remove(taskId));
+        
+        AgentSession session = findSession(taskId);
+        if (session != null) {
+            session.setEmitter(emitter);
+        }
     }
 
     @Override
@@ -78,6 +93,8 @@ public class TestAutomationServiceImpl implements TestAutomationService {
         }
 
         log.info("Resuming task {} with user input: {}", taskId, userInput);
+        log.info("Session emitter before provideInput: {}", session.getEmitter() != null ? "valid" : "null");
+        
         taskResponse.setStatus(TestTaskStatus.RUNNING);
         taskResponse.setNeedsInputPrompt(null);
 
@@ -87,6 +104,8 @@ public class TestAutomationServiceImpl implements TestAutomationService {
         taskResponse.setResult(runningResult);
 
         session.provideInput(userInput);
+        
+        log.info("User input provided, session latch released");
 
         return taskResponse;
     }
@@ -122,6 +141,31 @@ public class TestAutomationServiceImpl implements TestAutomationService {
         }
         taskResponse.setStatus(TestTaskStatus.RUNNING);
         log.info("Executing task {} targetUrl={} visual={} mode=AGENT_LOOP", taskId, request.getTargetUrl(), request.isVisual());
+        
+        SseEmitter emitter = emitterStore.get(taskId);
+        if (emitter == null) {
+            log.warn("Emitter not yet registered for task {}, waiting up to 5 seconds...", taskId);
+            try {
+                Thread.sleep(1000);
+                emitter = emitterStore.get(taskId);
+                if (emitter == null) {
+                    Thread.sleep(1000);
+                    emitter = emitterStore.get(taskId);
+                    if (emitter == null) {
+                        Thread.sleep(1000);
+                        emitter = emitterStore.get(taskId);
+                    }
+                }
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+            }
+            if (emitter == null) {
+                log.error("Emitter still null after waiting, SSE events will not be sent!");
+            } else {
+                log.info("Emitter successfully retrieved for task {}", taskId);
+            }
+        }
+        
         try {
             List<TestAction> actions = request.getActions() != null && !request.getActions().isEmpty()
                     ? request.getActions()
@@ -150,14 +194,16 @@ public class TestAutomationServiceImpl implements TestAutomationService {
                 }
 
                 AgentLoopResult loopResult;
+                
                 if (callback != null && browserAutomationService instanceof com.gao.agent.service.browser.SeleniumBrowserAutomationService seleniumService) {
-                    loopResult = seleniumService.runAgentLoopWithSession(
+                    loopResult = seleniumService.runAgentLoopWithSse(
                             request.getTargetUrl(),
                             request.getTaskDescription(),
                             request.getBrowser().name(),
                             request.isVisual(),
                             taskId,
-                            callback);
+                            callback,
+                            emitter);
                 } else {
                     loopResult = browserAutomationService.runAgentLoop(
                             request.getTargetUrl(),
@@ -188,6 +234,8 @@ public class TestAutomationServiceImpl implements TestAutomationService {
             log.info("Task {} completed with status {}", taskId, taskResponse.getStatus());
         } catch (Exception ex) {
             log.error("Task {} execution failed", taskId, ex);
+            sendSseError(taskId, ex.getMessage());
+            
             TestExecutionResult failedResult = new TestExecutionResult();
             failedResult.setSuccess(false);
             failedResult.setMessage("Execution exception: " + ex.getMessage());
@@ -197,6 +245,19 @@ public class TestAutomationServiceImpl implements TestAutomationService {
             failedResult.setDetails(sw.toString());
             taskResponse.setResult(failedResult);
             taskResponse.setStatus(TestTaskStatus.FAILED);
+        }
+    }
+
+    private void sendSseError(String taskId, String errorMessage) {
+        SseEmitter emitter = emitterStore.get(taskId);
+        if (emitter != null) {
+            try {
+                com.gao.agent.model.AgentStreamEvent errorEvent = 
+                    com.gao.agent.model.AgentStreamEvent.error(taskId, -1, errorMessage);
+                emitter.send(SseEmitter.event().name(errorEvent.type()).data(errorEvent));
+            } catch (Exception e) {
+                log.warn("Failed to send SSE error event", e);
+            }
         }
     }
 
