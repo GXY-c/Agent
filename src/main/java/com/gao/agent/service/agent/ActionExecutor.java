@@ -2,10 +2,9 @@ package com.gao.agent.service.agent;
 
 import org.openqa.selenium.JavascriptExecutor;
 import org.openqa.selenium.OutputType;
+import org.openqa.selenium.StaleElementReferenceException;
 import org.openqa.selenium.TakesScreenshot;
 import org.openqa.selenium.WebDriver;
-import org.openqa.selenium.WebElement;
-import org.openqa.selenium.interactions.Actions;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.stereotype.Component;
@@ -17,30 +16,153 @@ public class ActionExecutor {
 
     private static final Logger log = LoggerFactory.getLogger(ActionExecutor.class);
 
+    private final PageStateService pageStateService;
+
+    public ActionExecutor(PageStateService pageStateService) {
+        this.pageStateService = pageStateService;
+    }
+
     public ActionResult clickElement(BrowserState state, int index) {
+        return clickElement(state, index, null);
+    }
+
+    public ActionResult clickElement(BrowserState state, int index, WebDriver driver) {
+        if (driver == null) {
+            return ActionResult.fail("WebDriver is required for JS-based click");
+        }
         try {
-            WebElement el = state.getElement(index);
-            if (el == null) return ActionResult.fail("Element index " + index + " not found in state");
-            el.click();
-            log.info("clickElement [{}] → clicked <{}>", index, el.getTagName());
-            return ActionResult.ok("Clicked [" + index + "] <" + el.getTagName() + ">");
+            JavascriptExecutor js = (JavascriptExecutor) driver;
+            Object result = js.executeScript(
+                "var els=window.__agentEls||[];" +
+                "var idx=arguments[0];" +
+                "if(idx<0||idx>=els.length)return 'NOT_FOUND';" +
+                "var el=els[idx];" +
+                "if(typeof el.click==='function'){el.click();}" +
+                "else{el.dispatchEvent(new MouseEvent('click',{bubbles:true,cancelable:true,view:window}));}" +
+                "return el.tagName.toLowerCase();",
+                index);
+
+            if ("NOT_FOUND".equals(result)) {
+                log.warn("clickElement [{}] not found in window.__agentEls", index);
+                return ActionResult.fail("Element index " + index + " not found");
+            }
+
+            String tag = String.valueOf(result);
+            BrowserState.ElementInfo info = state.getSelectorMap() != null ? state.getSelectorMap().get(index) : null;
+            String desc = info != null ? info.getTag() : tag;
+            log.info("clickElement [{}] → JS clicked <{}>", index, desc);
+            return ActionResult.ok("Clicked [" + index + "] <" + desc + ">");
+        } catch (StaleElementReferenceException e) {
+            return retryClick(state, index, driver);
         } catch (Exception e) {
             log.error("clickElement [{}] failed", index, e);
             return ActionResult.fail("Click failed: " + e.getMessage());
         }
     }
 
-    public ActionResult inputText(BrowserState state, int index, String text) {
+    private ActionResult retryClick(BrowserState state, int index, WebDriver driver) {
+        log.warn("clickElement [{}] stale, retrying after 300ms", index);
         try {
-            WebElement el = state.getElement(index);
-            if (el == null) return ActionResult.fail("Element index " + index + " not found in state");
-            el.clear();
-            el.sendKeys(text);
-            log.info("inputText [{}] → typed '{}' into <{}>", index, text, el.getTagName());
-            return ActionResult.ok("Input '" + text + "' into [" + index + "] <" + el.getTagName() + ">");
+            Thread.sleep(300);
+            pageStateService.getBrowserState(driver);
+            JavascriptExecutor js = (JavascriptExecutor) driver;
+            Object result = js.executeScript(
+                "var els=window.__agentEls||[];" +
+                "var idx=arguments[0];" +
+                "if(idx<0||idx>=els.length)return 'NOT_FOUND';" +
+                "var el=els[idx];" +
+                "if(typeof el.click==='function'){el.click();}" +
+                "else{el.dispatchEvent(new MouseEvent('click',{bubbles:true,cancelable:true,view:window}));}" +
+                "return el.tagName.toLowerCase();",
+                index);
+
+            if ("NOT_FOUND".equals(result)) {
+                return ActionResult.fail("Element index " + index + " not found after retry");
+            }
+
+            BrowserState.ElementInfo info = state.getSelectorMap() != null ? state.getSelectorMap().get(index) : null;
+            String desc = info != null ? info.getTag() : String.valueOf(result);
+            log.info("clickElement [{}] → JS clicked on retry <{}>", index, desc);
+            return ActionResult.ok("Clicked [" + index + "] <" + desc + "> (retry)");
+        } catch (Exception retryEx) {
+            log.error("clickElement [{}] retry failed", index, retryEx);
+            return ActionResult.fail("Click failed after retry: " + retryEx.getMessage());
+        }
+    }
+
+    public ActionResult inputText(BrowserState state, int index, String text) {
+        return inputText(state, index, text, null);
+    }
+
+    public ActionResult inputText(BrowserState state, int index, String text, WebDriver driver) {
+        if (driver == null) {
+            return ActionResult.fail("WebDriver is required for JS-based input");
+        }
+        try {
+            JavascriptExecutor js = (JavascriptExecutor) driver;
+            Object result = js.executeScript(
+                "var els=window.__agentEls||[];" +
+                "var idx=arguments[0],text=arguments[1];" +
+                "if(idx<0||idx>=els.length)return 'NOT_FOUND';" +
+                "var el=els[idx];" +
+                "el.focus();" +
+                "if(el.tagName==='SELECT'){el.value=text;}" +
+                "else if(el.isContentEditable){el.textContent=text;}" +
+                "else if(el.tagName==='INPUT'||el.tagName==='TEXTAREA'){el.value=text;}" +
+                "else{el.textContent=text;}" +
+                "el.dispatchEvent(new Event('input',{bubbles:true}));" +
+                "el.dispatchEvent(new Event('change',{bubbles:true}));" +
+                "return el.tagName.toLowerCase();",
+                index, text);
+
+            if ("NOT_FOUND".equals(result)) {
+                log.warn("inputText [{}] not found in window.__agentEls", index);
+                return ActionResult.fail("Element index " + index + " not found");
+            }
+
+            String tag = String.valueOf(result);
+            BrowserState.ElementInfo info = state.getSelectorMap() != null ? state.getSelectorMap().get(index) : null;
+            String desc = info != null ? info.getTag() : tag;
+            log.info("inputText [{}] → JS typed '{}' into <{}>", index, text, desc);
+            return ActionResult.ok("Input '" + text + "' into [" + index + "] <" + desc + ">");
+        } catch (StaleElementReferenceException e) {
+            return retryInput(state, index, text, driver);
         } catch (Exception e) {
             log.error("inputText [{}] failed", index, e);
             return ActionResult.fail("Input failed: " + e.getMessage());
+        }
+    }
+
+    private ActionResult retryInput(BrowserState state, int index, String text, WebDriver driver) {
+        log.warn("inputText [{}] stale, retrying after 300ms", index);
+        try {
+            Thread.sleep(300);
+            pageStateService.getBrowserState(driver);
+            JavascriptExecutor js = (JavascriptExecutor) driver;
+            Object result = js.executeScript(
+                "var els=window.__agentEls||[];" +
+                "var idx=arguments[0],text=arguments[1];" +
+                "if(idx<0||idx>=els.length)return 'NOT_FOUND';" +
+                "var el=els[idx];" +
+                "el.focus();" +
+                "if(el.tagName==='SELECT'){el.value=text;}" +
+                "else if(el.isContentEditable){el.textContent=text;}" +
+                "else if(el.tagName==='INPUT'||el.tagName==='TEXTAREA'){el.value=text;}" +
+                "else{el.textContent=text;}" +
+                "el.dispatchEvent(new Event('input',{bubbles:true}));" +
+                "el.dispatchEvent(new Event('change',{bubbles:true}));" +
+                "return el.tagName.toLowerCase();",
+                index, text);
+
+            if ("NOT_FOUND".equals(result)) {
+                return ActionResult.fail("Element index " + index + " not found after retry");
+            }
+
+            log.info("inputText [{}] → JS typed '{}' on retry", index, text);
+            return ActionResult.ok("Input '" + text + "' into [" + index + "] (retry)");
+        } catch (Exception retryEx) {
+            log.error("inputText [{}] retry failed", index, retryEx);
+            return ActionResult.fail("Input failed after retry: " + retryEx.getMessage());
         }
     }
 

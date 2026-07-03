@@ -20,6 +20,7 @@ public class PageStateService {
     private static final Logger log = LoggerFactory.getLogger(PageStateService.class);
 
     private static final String JS_COLLECT =
+        "window.__agentEls=[];" +
         "var IC=new Set(['pointer','move','text','grab','grabbing','cell','copy','alias'," +
         "'all-scroll','col-resize','context-menu','crosshair','e-resize','ew-resize','help'," +
         "'n-resize','ne-resize','nesw-resize','ns-resize','nw-resize','nwse-resize','row-resize'," +
@@ -77,7 +78,8 @@ public class PageStateService {
         "R.push({tag:t,text:tx,type:c.getAttribute('type')||'',name:c.getAttribute('name')||''," +
         "id:c.getAttribute('id')||'',ph:c.getAttribute('placeholder')||''," +
         "al:c.getAttribute('aria-label')||'',role:c.getAttribute('role')||''," +
-        "href:c.getAttribute('href')||'',cls:(c.className&&typeof c.className==='string'?c.className:'').split(' ').slice(0,3).join(' ')});}}" +
+        "href:c.getAttribute('href')||'',cls:(c.className&&typeof c.className==='string'?c.className:'').split(' ').slice(0,3).join(' ')});" +
+        "window.__agentEls.push(c);}}" +
         "walk(c);}}" +
         "walk(document.body);return R;";
 
@@ -136,25 +138,6 @@ public class PageStateService {
 
                     idx++;
                 }
-            }
-
-            List<WebElement> webEls = driver.findElements(By.cssSelector(
-                    "input, select, textarea, button, a, [role], [contenteditable='true'], " +
-                    "[onclick], [tabindex], [data-action], [data-toggle], " +
-                    "[aria-haspopup], [aria-expanded], [aria-checked], [aria-pressed], [aria-selected], " +
-                    ".el-menu-item, .el-submenu__title, .el-select, .el-button, .el-checkbox, .el-radio, .el-switch, " +
-                    ".ant-menu-item, .ant-menu-submenu-title, .ant-select, .ant-btn, " +
-                    ".button, .dropdown-toggle, .nav-item, .sidebar-item, .menu-item, " +
-                    "[class*='menu-item'], [class*='nav-item'], [class*='sidebar-item']"
-            ));
-            int webIdx = 0;
-            for (WebElement el : webEls) {
-                try {
-                    if (el.isDisplayed() && selectorMap.containsKey(webIdx)) {
-                        state.putElement(webIdx, el);
-                    }
-                    webIdx++;
-                } catch (Exception ignored) {}
             }
 
         } catch (Exception e) {

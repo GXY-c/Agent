@@ -229,13 +229,13 @@ public class AgentLoopService {
                 if (action.getIndex() == null) {
                     yield ActionExecutor.ActionResult.fail("click_element 动作缺少 index 参数");
                 }
-                yield executor.clickElement(state, action.getIndex());
+                yield executor.clickElement(state, action.getIndex(), driver);
             }
             case input_text    -> {
                 if (action.getIndex() == null) {
                     yield ActionExecutor.ActionResult.fail("input_text 动作缺少 index 参数");
                 }
-                yield executor.inputText(state, action.getIndex(), action.getText());
+                yield executor.inputText(state, action.getIndex(), action.getText(), driver);
             }
             case scroll        -> executor.scroll(driver, action.getPixels() != null ? action.getPixels() : 500);
             case go_to_url     -> executor.navigate(driver, action.getUrl());
