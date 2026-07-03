@@ -344,6 +344,7 @@ public class OpenAiLargeModelService implements LargeModelService {
         String json = sanitizeResponseText(content);
         json = json.trim();
 
+        // 尝试提取第一个完整的 JSON 对象
         if (json.startsWith("[")) {
             int depth = 0, start = -1;
             boolean inStr = false, esc = false;
@@ -376,6 +377,12 @@ public class OpenAiLargeModelService implements LargeModelService {
                             log.info("Parsed via regex fallback: action={}", fallback.getAction());
                             return fallback;
                         }
+                        // 新增：尝试从自然语言中提取 needs_input 意图
+                        AgentAction naturalAction = tryExtractNeedsInputFromText(content);
+                        if (naturalAction != null) {
+                            log.info("Extracted needs_input from natural language");
+                            return naturalAction;
+                        }
                         return buildDoneAction("LLM返回非JSON内容，视为任务结束");
                     }
                 }
@@ -384,6 +391,12 @@ public class OpenAiLargeModelService implements LargeModelService {
                 if (parsed != null) {
                     log.info("Parsed key=value format successfully: action={}", parsed.getAction());
                     return parsed;
+                }
+                // 新增：尝试从自然语言中提取 needs_input 意图
+                AgentAction naturalAction = tryExtractNeedsInputFromText(content);
+                if (naturalAction != null) {
+                    log.info("Extracted needs_input from natural language");
+                    return naturalAction;
                 }
                 log.warn("LLM response is not JSON: '{}', defaulting to done", content.length() > 200 ? content.substring(0, 200) : content);
                 return buildDoneAction("LLM返回非JSON内容，视为任务结束");
@@ -426,6 +439,12 @@ public class OpenAiLargeModelService implements LargeModelService {
             if (fallback != null) {
                 log.info("Regex fallback succeeded: action={}", fallback.getAction());
                 return fallback;
+            }
+            // 新增：尝试从自然语言中提取 needs_input 意图
+            AgentAction naturalAction = tryExtractNeedsInputFromText(content);
+            if (naturalAction != null) {
+                log.info("Extracted needs_input from natural language after JSON parse failure");
+                return naturalAction;
             }
             log.warn("All parse attempts failed, defaulting to done", e);
             return buildDoneAction("LLM返回了无法解析的内容: " + (json.length() > 100 ? json.substring(0, 100) : json));
@@ -493,6 +512,40 @@ public class OpenAiLargeModelService implements LargeModelService {
         m = thinkingPat.matcher(content); if (m.find()) action.setThinking(m.group(1));
 
         return action;
+    }
+
+    /**
+     * 从自然语言文本中提取 needs_input 意图
+     * 当 LLM 返回非标准格式但明显表示需要用户输入时调用
+     */
+    private AgentAction tryExtractNeedsInputFromText(String content) {
+        if (content == null || content.isEmpty()) {
+            return null;
+        }
+        
+        String lower = content.toLowerCase();
+        
+        // 检测是否需要用户输入的关键词
+        boolean needsInput = lower.contains("需要用户") 
+            || lower.contains("需要输入") 
+            || lower.contains("请提供") 
+            || lower.contains("请输入") 
+            || lower.contains("验证码") 
+            || lower.contains("captcha")
+            || lower.contains("verification code")
+            || lower.contains("manual input")
+            || lower.contains("user input required");
+        
+        if (needsInput) {
+            AgentAction action = new AgentAction();
+            action.setAction(AgentAction.ActionType.needs_input);
+            action.setSummary(content.length() > 500 ? content.substring(0, 500) : content);
+            action.setThinking("从自然语言推断：检测到需要用户输入的意图");
+            log.info("Detected needs_input intent from natural language text");
+            return action;
+        }
+        
+        return null;
     }
 
     private AgentAction tryInferActionFromNaturalLanguage(String content) {
