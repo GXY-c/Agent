@@ -2,7 +2,7 @@
   <div class="app-container">
     <header>
       <div>
-        <h1>🤖 AgentRunner - 自动化测试执行器</h1>
+        <h1> 🤖AIRunner - 自动化前端UI测试</h1>
         <p>左侧配置任务，右侧实时查看 AI 思考过程和操作步骤。Selenium 将打开独立浏览器窗口执行操作。</p>
       </div>
     </header>

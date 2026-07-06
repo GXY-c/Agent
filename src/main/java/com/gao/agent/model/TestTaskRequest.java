@@ -14,7 +14,6 @@ import jakarta.validation.constraints.NotBlank;
  * 后端根据这些信息启动 Agent Loop 自动执行浏览器操作。
  */
 public class TestTaskRequest {
-
     /** 目标页面 URL（必须包含协议前缀，如 http://localhost:5173/login） */
     @NotBlank(message = "targetUrl must not be blank")
     private String targetUrl;
