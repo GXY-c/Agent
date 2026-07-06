@@ -94,6 +94,10 @@
                   </div>
                   <div class="message-text">{{ step.content }}</div>
                   <div v-if="step.details" class="message-details">{{ step.details }}</div>
+                  <div v-if="step.screenshot" class="screenshot-container">
+                    <p class="screenshot-label">📸 最终页面截图</p>
+                    <img :src="step.screenshot" class="screenshot-img" @click="openScreenshot(step.screenshot)" />
+                  </div>
                 </div>
               </div>
             </div>
@@ -119,6 +123,10 @@
         </div>
       </section>
     </main>
+
+    <div v-if="previewScreenshot" class="screenshot-overlay" @click="previewScreenshot = ''">
+      <img :src="previewScreenshot" class="screenshot-preview" />
+    </div>
   </div>
 </template>
 
@@ -138,6 +146,7 @@ const polling = ref(false);
 const needsInputPrompt = ref('');
 const userInputText = ref('');
 const chatContainer = ref(null);
+const previewScreenshot = ref('');
 let pollInterval = null;
 let eventSource = null;
 
@@ -333,6 +342,7 @@ function addDoneStep(data) {
     step: data.step,
     content: data.content,
     success: data.success,
+    screenshot: data.screenshot || '',
     timestamp: Date.now()
   });
   status.value = data.success ? 'SUCCESS' : 'FAILED';
@@ -445,6 +455,10 @@ function showError(message) {
     timestamp: Date.now()
   }];
   document.querySelector('.left-panel button').disabled = false;
+}
+
+function openScreenshot(src) {
+  previewScreenshot.value = src;
 }
 </script>
 
@@ -779,6 +793,55 @@ button:disabled {
   color: var(--muted);
   margin-top: 4px;
   font-style: italic;
+}
+
+.screenshot-container {
+  margin-top: 12px;
+}
+
+.screenshot-label {
+  font-size: 12px;
+  color: var(--muted);
+  margin: 0 0 6px;
+  font-weight: 600;
+}
+
+.screenshot-img {
+  max-width: 100%;
+  max-height: 240px;
+  border: 2px solid #e0e0e0;
+  border-radius: 8px;
+  cursor: pointer;
+  transition: transform 0.2s, box-shadow 0.2s;
+  object-fit: contain;
+}
+
+.screenshot-img:hover {
+  transform: scale(1.02);
+  box-shadow: 0 4px 16px rgba(0, 0, 0, 0.15);
+  border-color: var(--accent);
+}
+
+.screenshot-overlay {
+  position: fixed;
+  top: 0;
+  left: 0;
+  width: 100vw;
+  height: 100vh;
+  background: rgba(0, 0, 0, 0.8);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  z-index: 9999;
+  cursor: pointer;
+}
+
+.screenshot-preview {
+  max-width: 90vw;
+  max-height: 90vh;
+  border-radius: 12px;
+  box-shadow: 0 8px 40px rgba(0, 0, 0, 0.5);
+  object-fit: contain;
 }
 
 .waiting-input-card {

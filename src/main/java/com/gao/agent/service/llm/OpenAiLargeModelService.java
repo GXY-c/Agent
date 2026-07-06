@@ -23,9 +23,25 @@ import org.springframework.stereotype.Component;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.gao.agent.model.AgentAction;
+import com.gao.agent.model.ConversationMessage;
 import com.gao.agent.model.TestAction;
 import com.gao.agent.model.TestActionType;
 
+/**
+ * 基于 OpenAI 兼容 API 的大模型服务实现。
+ * 通过 HTTP 调用 OpenAI 兼容的 Chat Completions API（如阿里云百炼 qwen-max），
+ * 提供测试计划生成和 Agent Loop 决策能力。
+ *
+ * 核心特性：
+ * <ul>
+ *   <li>支持文本模式（decideNextAction）和 Vision 多模态模式（decideNextActionWithVision）</li>
+ *   <li>多层容错解析：JSON 解析 → 正则提取 → key=value 格式 → 自然语言推断</li>
+ *   <li>兼容非标准 API 响应格式（qwen-max 返回 text 字段而非 choices）</li>
+ *   <li>LLM 返回非 JSON 时自动追加格式纠正提示并重试</li>
+ * </ul>
+ *
+ * 激活条件：application.properties 中设置 llm.openai.enabled=true
+ */
 @Component
 @Primary
 @ConditionalOnProperty(prefix = "llm.openai", name = "enabled", havingValue = "true", matchIfMissing = false)
@@ -36,22 +52,34 @@ public class OpenAiLargeModelService implements LargeModelService {
     private final String apiKey;
     private final String baseUrl;
     private final String model;
+    /** Vision 模型名称（未配置时使用 model） */
+    private final String visionModel;
+    private final boolean visionEnabled;
     private final HttpClient httpClient;
     private final ObjectMapper objectMapper;
 
     public OpenAiLargeModelService(
             @Value("${llm.openai.api-key:}") String apiKey,
             @Value("${llm.openai.base-url:https://api.openai.com/v1}") String baseUrl,
-            @Value("${llm.openai.model:gpt-4o-mini}") String model) {
+            @Value("${llm.openai.model:gpt-4o-mini}") String model,
+            @Value("${llm.openai.vision-model:}") String visionModel,
+            @Value("${llm.openai.vision-enabled:false}") boolean visionEnabled) {
         this.apiKey = apiKey;
         this.baseUrl = baseUrl;
         this.model = model;
+        this.visionModel = (visionModel != null && !visionModel.isBlank()) ? visionModel : model;
+        this.visionEnabled = visionEnabled;
         this.httpClient = HttpClient.newBuilder()
                 .connectTimeout(Duration.ofSeconds(10))
                 .build();
         this.objectMapper = new ObjectMapper();
     }
 
+    /**
+     * 根据页面元素生成测试计划（预生成计划模式）。
+     * 构建系统提示词约束 LLM 输出 JSON 数组，包含 NAVIGATE/CLICK/TYPE 等操作。
+     * 特别处理验证码场景：从页面元素中提取验证码文本并填入对应输入框。
+     */
     @Override
     public List<TestAction> buildTestPlan(String targetUrl, String taskDescription, String pageElements) {
         if (apiKey == null || apiKey.isBlank()) {
@@ -103,21 +131,15 @@ public class OpenAiLargeModelService implements LargeModelService {
             }
 
             JsonNode responseRoot = objectMapper.readTree(response.body());
-            JsonNode choices = responseRoot.path("choices");
-            if (!choices.isArray() || choices.size() == 0) {
-                throw new IOException("LLM response has no choices: " + response.body());
-            }
-
-            JsonNode message = choices.get(0).path("message");
-            String content = message.path("content").asText(null);
+            String content = extractContent(responseRoot);
 
             if (content == null || content.isEmpty()) {
-                content = message.path("reasoning_content").asText(null);
-                log.info("Falling back to reasoning_content: {}", content != null ? content.substring(0, Math.min(100, content.length())) : "null");
+                log.warn("extractContent returned null, raw response: {}", response.body());
+                throw new IOException("LLM response has no usable content: " + response.body());
             }
 
             log.info("LLM extracted content (first 200 chars): {}",
-                    content != null ? content.substring(0, Math.min(200, content.length())) : "null");
+                    content.substring(0, Math.min(200, content.length())));
 
             return parseActions(content, targetUrl);
         } catch (IOException | InterruptedException ex) {
@@ -126,6 +148,11 @@ public class OpenAiLargeModelService implements LargeModelService {
         }
     }
 
+    /**
+     * 解析 LLM 返回的 JSON 动作数组为 TestAction 列表。
+     * 流程：清理文本 → 提取 JSON 数组 → 解析为 TestAction 列表。
+     * 如果结果中没有 NAVIGATE 动作，自动在开头插入。
+     */
     private List<TestAction> parseActions(String content, String targetUrl) throws IOException {
         log.info("=== LLM Raw Response ===");
         log.info(content);
@@ -149,6 +176,7 @@ public class OpenAiLargeModelService implements LargeModelService {
         log.info("======================");
 
         JsonNode root = objectMapper.readTree(json);
+        // 兼容 {"actions": [...]} 包装格式
         if (root.isObject() && root.has("actions")) {
             root = root.get("actions");
         }
@@ -189,6 +217,7 @@ public class OpenAiLargeModelService implements LargeModelService {
             actions.add(action);
         }
 
+        // 确保列表以 NAVIGATE 开头
         if (actions.stream().noneMatch(a -> a.getType() == TestActionType.NAVIGATE)) {
             TestAction navigate = new TestAction(TestActionType.NAVIGATE);
             navigate.addParameter("url", targetUrl);
@@ -198,11 +227,14 @@ public class OpenAiLargeModelService implements LargeModelService {
         return actions;
     }
 
-    // 正则: (?s) + 三个反引号 + (?:json)? + \s* + (.*?) + \s* + 三个反引号
     private static final Pattern MD_FENCE = Pattern.compile(
             "(?s)```(?:json)?\s*(.*?)```"
                     , Pattern.CASE_INSENSITIVE);
 
+    /**
+     * 从文本中提取 JSON 数组。
+     * 先尝试去除 Markdown 代码块包裹，再通过括号匹配算法找到完整的 JSON 数组。
+     */
     private String extractJsonArray(String content) {
         if (content == null) {
             return null;
@@ -212,8 +244,10 @@ public class OpenAiLargeModelService implements LargeModelService {
         if (fenceMatcher.find()) {
             trimmed = fenceMatcher.group(1).trim();
         }
+        // 去除尾部逗号（如 [1, 2, 3,] → [1, 2, 3]）
         trimmed = trimmed.replaceAll(",\\s*]", "]");
 
+        // 括号匹配：找到第一个完整的 JSON 数组
         int length = trimmed.length();
         for (int start = 0; start < length; start++) {
             if (trimmed.charAt(start) != '[') continue;
@@ -236,6 +270,10 @@ public class OpenAiLargeModelService implements LargeModelService {
         return null;
     }
 
+    /**
+     * 清理 LLM 响应文本。
+     * 去除 Markdown 代码块包裹和首尾引号。
+     */
     private String sanitizeResponseText(String content) {
         if (content == null) return null;
         String text = content.trim();
@@ -251,6 +289,86 @@ public class OpenAiLargeModelService implements LargeModelService {
 
     // ==================== Agent Loop 模式 ====================
 
+    /** 标识是否支持 Vision 多模态 */
+    @Override
+    public boolean supportsVision() {
+        return visionEnabled;
+    }
+
+    /**
+     * Vision 多模态 Agent Loop 决策。
+     * 将对话历史中的截图以 base64 图片 URL 形式发送给 Vision API，
+     * 让 LLM 同时分析页面文本和截图来决策下一步动作。
+     * 未启用 Vision 时降级为纯文本模式。
+     */
+    @Override
+    public AgentAction decideNextActionWithVision(List<ConversationMessage> messages) {
+        if (!visionEnabled) {
+            return decideNextAction(messages.stream()
+                    .map(m -> Map.of("role", m.getRole(),
+                            "content", m.getTextContent() != null ? m.getTextContent() : ""))
+                    .toList());
+        }
+        if (apiKey == null || apiKey.isBlank()) {
+            throw new IllegalStateException("OpenAI API key is not configured.");
+        }
+        try {
+            // 构建多模态消息：文本 + 图片
+            List<Object> apiMessages = new ArrayList<>();
+            for (ConversationMessage msg : messages) {
+                if (msg.hasImages()) {
+                    List<Map<String, Object>> contentParts = new ArrayList<>();
+                    contentParts.add(Map.of("type", "text", "text", msg.getTextContent() != null ? msg.getTextContent() : ""));
+                    for (ConversationMessage.ImageContent img : msg.getImages()) {
+                        Map<String, Object> imagePart = new java.util.LinkedHashMap<>();
+                        imagePart.put("type", "image_url");
+                        imagePart.put("image_url", Map.of("url", img.getUrl(), "detail", img.getDetail()));
+                        contentParts.add(imagePart);
+                    }
+                    apiMessages.add(Map.of("role", msg.getRole(), "content", contentParts));
+                } else {
+                    apiMessages.add(Map.of("role", msg.getRole(), "content",
+                            msg.getTextContent() != null ? msg.getTextContent() : ""));
+                }
+            }
+
+            String body = objectMapper.writeValueAsString(Map.of(
+                    "model", visionModel,
+                    "temperature", 0.2,
+                    "max_tokens", 4096,
+                    "messages", apiMessages));
+
+            log.debug("Vision API request body size: {} chars", body.length());
+
+            HttpRequest req = HttpRequest.newBuilder()
+                    .uri(URI.create(baseUrl + "/chat/completions"))
+                    .timeout(Duration.ofSeconds(120))
+                    .header("Content-Type", "application/json")
+                    .header("Authorization", "Bearer " + apiKey)
+                    .POST(HttpRequest.BodyPublishers.ofString(body))
+                    .build();
+
+            HttpResponse<String> resp = httpClient.send(req, HttpResponse.BodyHandlers.ofString());
+            if (resp.statusCode() >= 300) {
+                throw new IOException("Vision API error: " + resp.statusCode() + " " + resp.body());
+            }
+
+            JsonNode root = objectMapper.readTree(resp.body());
+            String content = extractContent(root);
+            log.info("Vision LLM decided: {}", content != null ? content.substring(0, Math.min(200, content.length())) : "null");
+
+            return parseSingleAction(content);
+        } catch (IOException | InterruptedException ex) {
+            Thread.currentThread().interrupt();
+            throw new IllegalStateException("decideNextActionWithVision failed", ex);
+        }
+    }
+
+    /**
+     * 纯文本 Agent Loop 决策。
+     * 将对话历史发送给 LLM，获取下一步动作的 JSON 响应。
+     * 如果 LLM 返回非 JSON 内容，自动追加格式纠正提示并重试一次。
+     */
     @Override
     public AgentAction decideNextAction(List<Map<String, String>> conversationHistory) {
         if (apiKey == null || apiKey.isBlank()) {
@@ -273,25 +391,18 @@ public class OpenAiLargeModelService implements LargeModelService {
                     .build();
 
             HttpResponse<String> resp = httpClient.send(req, HttpResponse.BodyHandlers.ofString());
+            log.info("LLM response status={}, body={}", resp.statusCode(), resp.body().length() > 2000 ? resp.body().substring(0, 2000) : resp.body());
             if (resp.statusCode() >= 300) {
                 throw new IOException("OpenAI error: " + resp.statusCode() + " " + resp.body());
             }
 
             JsonNode root = objectMapper.readTree(resp.body());
-            JsonNode choices = root.path("choices");
-            if (!choices.isArray() || choices.size() == 0) {
-                throw new IOException("No choices in response");
-            }
-
-            JsonNode msg = choices.get(0).path("message");
-            String content = msg.path("content").asText(null);
-            if (content == null || content.isEmpty()) {
-                content = msg.path("reasoning_content").asText(null);
-            }
+            String content = extractContent(root);
             log.info("LLM decided: {}", content != null ? content.substring(0, Math.min(200, content.length())) : "null");
 
             AgentAction action = parseSingleAction(content);
 
+            // LLM 返回非 JSON 时，追加格式纠正提示后重试
             if (action.getAction() == AgentAction.ActionType.done
                     && action.getSummary() != null
                     && action.getSummary().contains("非JSON")) {
@@ -300,9 +411,9 @@ public class OpenAiLargeModelService implements LargeModelService {
                 retryMsgs.add(Map.of("role", "assistant", "content", content != null ? content : ""));
                 retryMsgs.add(Map.of("role", "user", "content",
                         "你的回复不是JSON格式！请严格按照以下格式重新返回（不要输出任何其他内容）：\n" +
-                        "{\"action\": \"动作类型\", \"index\": 数字, \"thinking\": \"思考\"}\n" +
-                        "如果是最后一步，返回：\n" +
-                        "{\"action\": \"done\", \"success\": true/false, \"summary\": \"总结\"}"));
+                                "{\"action\": \"动作类型\", \"index\": 数字, \"thinking\": \"思考\"}\n" +
+                                "如果是最后一步，返回：\n" +
+                                "{\"action\": \"done\", \"success\": true/false, \"summary\": \"总结\"}"));
 
                 String retryBody = objectMapper.writeValueAsString(Map.of(
                         "model", model, "temperature", 0.1, "max_tokens", 4096, "messages", retryMsgs));
@@ -336,6 +447,51 @@ public class OpenAiLargeModelService implements LargeModelService {
         }
     }
 
+    /**
+     * 从 API 响应中提取文本内容。
+     * 兼容多种响应格式：
+     * <ol>
+     *   <li>标准 OpenAI 格式：choices[0].message.content</li>
+     *   <li>reasoning_content 字段（部分模型）</li>
+     *   <li>qwen-max 格式：text 字段</li>
+     *   <li>其他非标准格式：output 字段</li>
+     * </ol>
+     */
+    private String extractContent(JsonNode root) {
+        JsonNode choices = root.path("choices");
+        if (choices.isArray() && !choices.isEmpty()) {
+            JsonNode msg = choices.get(0).path("message");
+            String content = msg.path("content").asText(null);
+            if (content != null && !content.isEmpty()) return content;
+            content = msg.path("reasoning_content").asText(null);
+            if (content != null && !content.isEmpty()) return content;
+        }
+        String text = root.path("text").asText(null);
+        if (text != null && !text.isEmpty()) {
+            log.info("Extracted content from 'text' field (non-OpenAI format)");
+            return text;
+        }
+        String output = root.path("output").asText(null);
+        if (output != null && !output.isEmpty()) {
+            log.info("Extracted content from 'output' field (non-OpenAI format)");
+            return output;
+        }
+        log.error("No content found in response. Full response: {}", root.toString());
+        return null;
+    }
+
+    /**
+     * 解析单个 Agent 动作（Agent Loop 模式）。
+     * 多层容错解析策略（按优先级）：
+     * <ol>
+     *   <li>直接 JSON 解析</li>
+     *   <li>从数组中提取第一个 JSON 对象</li>
+     *   <li>从文本中提取花括号包裹的 JSON 并尝试修复</li>
+     *   <li>key=value 正则格式解析</li>
+     *   <li>自然语言意图推断（needs_input / 点击 / 输入 / 滚动 / 等待）</li>
+     *   <li>兜底：返回 done 动作（标记解析失败）</li>
+     * </ol>
+     */
     private AgentAction parseSingleAction(String content) throws IOException {
         if (content == null || content.trim().isEmpty()) {
             log.warn("LLM returned empty content, defaulting to done");
@@ -344,7 +500,7 @@ public class OpenAiLargeModelService implements LargeModelService {
         String json = sanitizeResponseText(content);
         json = json.trim();
 
-        // 尝试提取第一个完整的 JSON 对象
+        // 如果以数组开头，提取第一个 JSON 对象
         if (json.startsWith("[")) {
             int depth = 0, start = -1;
             boolean inStr = false, esc = false;
@@ -377,7 +533,6 @@ public class OpenAiLargeModelService implements LargeModelService {
                             log.info("Parsed via regex fallback: action={}", fallback.getAction());
                             return fallback;
                         }
-                        // 新增：尝试从自然语言中提取 needs_input 意图
                         AgentAction naturalAction = tryExtractNeedsInputFromText(content);
                         if (naturalAction != null) {
                             log.info("Extracted needs_input from natural language");
@@ -392,7 +547,6 @@ public class OpenAiLargeModelService implements LargeModelService {
                     log.info("Parsed key=value format successfully: action={}", parsed.getAction());
                     return parsed;
                 }
-                // 新增：尝试从自然语言中提取 needs_input 意图
                 AgentAction naturalAction = tryExtractNeedsInputFromText(content);
                 if (naturalAction != null) {
                     log.info("Extracted needs_input from natural language");
@@ -403,6 +557,7 @@ public class OpenAiLargeModelService implements LargeModelService {
             }
         }
 
+        // 清理尾部逗号
         json = json.replaceAll(",\\s*}", "}");
         json = json.replaceAll(",\\s*]", "]");
 
@@ -440,7 +595,6 @@ public class OpenAiLargeModelService implements LargeModelService {
                 log.info("Regex fallback succeeded: action={}", fallback.getAction());
                 return fallback;
             }
-            // 新增：尝试从自然语言中提取 needs_input 意图
             AgentAction naturalAction = tryExtractNeedsInputFromText(content);
             if (naturalAction != null) {
                 log.info("Extracted needs_input from natural language after JSON parse failure");
@@ -451,6 +605,10 @@ public class OpenAiLargeModelService implements LargeModelService {
         }
     }
 
+    /**
+     * 尝试修复格式不规范的 JSON。
+     * 先去除尾部逗号，如果仍无效则通过正则提取 key-value 对重建 JSON。
+     */
     private String tryFixJson(String json) {
         if (json == null) return null;
         String fixed = json.replaceAll(",\\s*}", "}");
@@ -460,6 +618,7 @@ public class OpenAiLargeModelService implements LargeModelService {
             objectMapper.readTree(fixed);
             return fixed;
         } catch (Exception e) {
+            // 用正则提取 key-value 对重建 JSON
             Pattern kvPat = Pattern.compile("\"(\\w+)\"\\s*:\\s*(\"(?:[^\"\\\\]|\\\\.)*\"|\\d+\\.?\\d*|true|false|null)");
             Matcher m = kvPat.matcher(json);
             StringBuilder sb = new StringBuilder("{");
@@ -477,6 +636,11 @@ public class OpenAiLargeModelService implements LargeModelService {
         }
     }
 
+    /**
+     * 从 key=value 格式的文本中解析 AgentAction。
+     * 处理 LLM 返回非 JSON 但包含 action="click" index=3 等键值对的情况。
+     * 如果找不到 action 键，降级到自然语言推断。
+     */
     private AgentAction tryParseKeyValueFormat(String content) {
         java.util.regex.Pattern actionPat = java.util.regex.Pattern.compile("action\\s*=\\s*\"([^\"]+)\"");
         java.util.regex.Pattern indexPat = java.util.regex.Pattern.compile("index\\s*=\\s*(\\d+)");
@@ -515,27 +679,27 @@ public class OpenAiLargeModelService implements LargeModelService {
     }
 
     /**
-     * 从自然语言文本中提取 needs_input 意图
-     * 当 LLM 返回非标准格式但明显表示需要用户输入时调用
+     * 从自然语言文本中提取 needs_input 意图。
+     * 当 LLM 返回非标准格式但明显表示需要用户输入时（如"需要输入验证码"、"请提供密码"），
+     * 自动识别为 needs_input 动作，避免解析失败。
      */
     private AgentAction tryExtractNeedsInputFromText(String content) {
         if (content == null || content.isEmpty()) {
             return null;
         }
-        
+
         String lower = content.toLowerCase();
-        
-        // 检测是否需要用户输入的关键词
-        boolean needsInput = lower.contains("需要用户") 
-            || lower.contains("需要输入") 
-            || lower.contains("请提供") 
-            || lower.contains("请输入") 
-            || lower.contains("验证码") 
-            || lower.contains("captcha")
-            || lower.contains("verification code")
-            || lower.contains("manual input")
-            || lower.contains("user input required");
-        
+
+        boolean needsInput = lower.contains("需要用户")
+                || lower.contains("需要输入")
+                || lower.contains("请提供")
+                || lower.contains("请输入")
+                || lower.contains("验证码")
+                || lower.contains("captcha")
+                || lower.contains("verification code")
+                || lower.contains("manual input")
+                || lower.contains("user input required");
+
         if (needsInput) {
             AgentAction action = new AgentAction();
             action.setAction(AgentAction.ActionType.needs_input);
@@ -544,14 +708,21 @@ public class OpenAiLargeModelService implements LargeModelService {
             log.info("Detected needs_input intent from natural language text");
             return action;
         }
-        
+
         return null;
     }
 
+    /**
+     * 从自然语言文本中推断操作类型。
+     * 支持识别：点击（click/按钮）→ click_element、输入（填写/type）→ input_text、
+     * 滚动（scroll）→ scroll、等待（wait）→ wait。
+     * 同时尝试从文本中提取 [数字] 格式的元素编号。
+     */
     private AgentAction tryInferActionFromNaturalLanguage(String content) {
         if (content == null || content.isEmpty()) return null;
         String lower = content.toLowerCase();
 
+        // 尝试提取文本中提到的元素编号 [数字]
         java.util.regex.Pattern indexInTextPat = java.util.regex.Pattern.compile("\\[(\\d+)\\]");
         java.util.regex.Matcher indexMatcher = indexInTextPat.matcher(content);
         Integer mentionedIndex = null;
@@ -568,6 +739,7 @@ public class OpenAiLargeModelService implements LargeModelService {
             return action;
         }
         if (lower.contains("输入") || lower.contains("填写") || lower.contains("type") || lower.contains("input")) {
+            // 尝试提取引号中的文本作为输入内容
             java.util.regex.Pattern quotePat = java.util.regex.Pattern.compile("[\"\"'']([^\"\"'']+)[\"\"'']");
             java.util.regex.Matcher qm = quotePat.matcher(content);
             String text = null;
@@ -599,10 +771,12 @@ public class OpenAiLargeModelService implements LargeModelService {
         return null;
     }
 
+    /** 校验字符串是否为合法 JSON */
     private boolean isValidJson(String s) {
         try { objectMapper.readTree(s); return true; } catch (Exception e) { return false; }
     }
 
+    /** 构建 done 动作（解析失败时的兜底） */
     private AgentAction buildDoneAction(String summary) {
         AgentAction action = new AgentAction();
         action.setAction(AgentAction.ActionType.done);

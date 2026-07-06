@@ -7,7 +7,6 @@ import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
 import java.util.NoSuchElementException;
-import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.function.Function;
 
@@ -25,11 +24,28 @@ import org.openqa.selenium.chrome.ChromeOptions;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.stereotype.Service;
+import org.springframework.web.servlet.mvc.method.annotation.SseEmitter;
 
 import com.gao.agent.service.agent.ActionExecutor;
 import com.gao.agent.service.agent.AgentLoopService;
 import com.gao.agent.service.agent.PageStateService;
 
+/**
+ * 基于 Selenium 的浏览器自动化服务实现。
+ * 提供两种执行模式：
+ * <ul>
+ *   <li>预生成计划模式（executeSteps）：按预定义的动作列表逐步执行</li>
+ *   <li>Agent Loop 模式（runAgentLoop / runAgentLoopWithSse）：由 LLM 逐步实时决策执行</li>
+ * </ul>
+ *
+ * 核心职责：
+ * <ul>
+ *   <li>浏览器生命周期管理：创建 Edge/Chrome 驱动，支持可视化/无头模式</li>
+ *   <li>页面元素采集：通过 JS 脚本扫描可交互元素，生成面向 LLM 的文本描述</li>
+ *   <li>Agent Loop 暂停/恢复：通过 CountDownLatch 阻塞等待用户输入，支持多次暂停</li>
+ *   <li>Session 管理：通过 ConcurrentHashMap 维护活跃会话，支持外部查询和关闭</li>
+ * </ul>
+ */
 @Service
 public class SeleniumBrowserAutomationService implements BrowserAutomationService {
 
@@ -38,23 +54,15 @@ public class SeleniumBrowserAutomationService implements BrowserAutomationServic
     private final PageStateService pageStateService;
     private final ActionExecutor executor;
     private final AgentLoopService agentLoopService;
+    /** 活跃会话表：taskId → AgentSession，用于暂停/恢复场景 */
     private final Map<String, AgentSession> activeSessions = new ConcurrentHashMap<>();
 
-    private static final String[] INTERACTIVE_ARIA_ATTRS = {
-            "aria-expanded", "aria-checked", "aria-selected",
-            "aria-pressed", "aria-haspopup", "aria-controls",
-            "aria-owns", "aria-activedescendant"
-    };
-
-    private static final String CANDIDATE_SELECTOR =
-            "input, select, textarea, button, a, [role], [contenteditable='true'], " +
-            "[onclick], [tabindex], [data-action], [data-toggle], [data-index], " +
-            "[aria-haspopup], [aria-expanded], [aria-checked], [aria-pressed], [aria-selected], " +
-            "[aria-controls], [aria-owns], [aria-activedescendant], " +
-            ".el-menu-item, .el-submenu__title, .el-select, .el-button, .el-checkbox, .el-radio, .el-switch, " +
-            ".ant-menu-item, .ant-menu-submenu-title, .ant-select, .ant-btn, .ant-checkbox, .ant-radio, .ant-switch, " +
-            ".button, .dropdown-toggle, .nav-item, .sidebar-item, .menu-item";
-
+    /**
+     * JS 元素采集脚本（预生成计划模式专用）。
+     * 与 PageStateService 中的脚本功能类似，但额外收集 cls（CSS 类名）属性，
+     * 用于 findElementByIndex 中通过 CSS 选择器定位元素。
+     * 注意：Agent Loop 模式使用 PageStateService 的采集脚本，不走此脚本。
+     */
     private static final String JS_COLLECT =
         "var IC=new Set(['pointer','move','text','grab','grabbing','cell','copy','alias'," +
         "'all-scroll','col-resize','context-menu','crosshair','e-resize','ew-resize','help'," +
@@ -125,10 +133,15 @@ public class SeleniumBrowserAutomationService implements BrowserAutomationServic
         this.agentLoopService = agentLoopService;
     }
 
+    /** 执行预定义步骤（简化版，默认 Edge + 无头模式） */
     public TestExecutionResult executeSteps(String targetUrl, List<TestAction> steps) {
         return executeSteps(targetUrl, steps, "EDGE", false);
     }
 
+    /**
+     * 执行预定义的测试步骤列表。
+     * 流程：创建浏览器 → 导航到目标页面 → 采集元素 → 逐步执行动作 → 关闭浏览器。
+     */
     @Override
     public TestExecutionResult executeSteps(String targetUrl, List<TestAction> steps, String browserName, boolean visual) {
         TestExecutionResult result = new TestExecutionResult();
@@ -157,10 +170,7 @@ public class SeleniumBrowserAutomationService implements BrowserAutomationServic
             log.error("Browser automation exception", ex);
             result.setSuccess(false);
             result.setMessage("Test execution failed");
-            java.io.StringWriter sw = new java.io.StringWriter();
-            java.io.PrintWriter pw = new java.io.PrintWriter(sw);
-            ex.printStackTrace(pw);
-            result.setDetails(sw.toString());
+            result.setDetails(getStackTrace(ex));
         } finally {
             if (driver != null) {
                 driver.quit();
@@ -169,55 +179,14 @@ public class SeleniumBrowserAutomationService implements BrowserAutomationServic
         return result;
     }
 
-    @Override
-    public TestExecutionResult executeWithAutoPlan(String targetUrl, String taskDescription, Function<String, List<TestAction>> planGenerator, String browserName, boolean visual) {
-        TestExecutionResult result = new TestExecutionResult();
-
-        WebDriver driver = null;
-        try {
-            driver = createDriver(browserName, visual);
-            driver.manage().timeouts().implicitlyWait(Duration.ofSeconds(5));
-            
-            String pageElements = collectPageElements(driver, targetUrl);
-            log.info("Collected page elements before execution:\n{}", pageElements);
-
-            List<TestAction> steps = planGenerator.apply(pageElements);
-            if (steps == null || steps.isEmpty()) {
-                throw new IllegalStateException("Generated test plan is empty");
-            }
-
-            for (TestAction action : steps) {
-                TestStepResult stepResult = executeAction(driver, action);
-                result.addStep(stepResult);
-                if (!stepResult.isSuccess()) {
-                    result.setSuccess(false);
-                    result.setMessage("Test execution failed at step: " + stepResult.getDescription());
-                    result.setDetails(stepResult.getDetails());
-                    return result;
-                }
-            }
-            result.setSuccess(true);
-            result.setMessage("Test execution completed");
-        } catch (Exception ex) {
-            log.error("Browser automation exception", ex);
-            result.setSuccess(false);
-            result.setMessage("Test execution failed");
-            java.io.StringWriter sw = new java.io.StringWriter();
-            java.io.PrintWriter pw = new java.io.PrintWriter(sw);
-            ex.printStackTrace(pw);
-            result.setDetails(sw.toString());
-        } finally {
-            if (driver != null) {
-                driver.quit();
-            }
-        }
-        return result;
-    }
-
+    /**
+     * 采集目标页面上的可交互元素（预生成计划模式专用）。
+     * 导航到页面 → 执行 JS_COLLECT 脚本 → 组装元素描述文本 → 检测验证码文本。
+     */
     private String collectPageElements(WebDriver driver, String targetUrl) {
         try {
             driver.get(targetUrl);
-            try { Thread.sleep(2000); } catch (InterruptedException e) { Thread.currentThread().interrupt(); }
+            sleep(2000);
 
             @SuppressWarnings("unchecked")
             List<Map<String, Object>> jsResults = (List<Map<String, Object>>)
@@ -253,28 +222,7 @@ public class SeleniumBrowserAutomationService implements BrowserAutomationServic
                 sb.append("\n");
             }
 
-            try {
-                Object captchaResult = ((JavascriptExecutor) driver).executeScript(
-                    "var results=[];var w=document.createTreeWalker(document.body,NodeFilter.SHOW_TEXT,null,false);" +
-                    "var n;while(n=w.nextNode()){var t=n.textContent.trim();" +
-                    "if(t.length>=2&&t.length<=8&&/^[A-Za-z0-9]+$/.test(t)){" +
-                    "var e=n.parentElement;if(e&&e.offsetParent!==null){" +
-                    "results.push('<'+e.tagName.toLowerCase()+'> text=\"'+t+'\"');}}}return results;"
-                );
-                if (captchaResult instanceof List && !((List<?>) captchaResult).isEmpty()) {
-                    sb.append("\n页面上的验证码/短文本内容：\n");
-                    @SuppressWarnings("unchecked")
-                    List<String> captchaTexts = (List<String>) captchaResult;
-                    int count = 0;
-                    for (String captchaText : captchaTexts) {
-                        if (count >= 20) break;
-                        sb.append("- ").append(captchaText).append("\n");
-                        count++;
-                    }
-                }
-            } catch (Exception e) {
-                log.warn("Failed to detect captcha text via JS: {}", e.getMessage());
-            }
+            collectCaptchaText(driver, sb);
 
             log.info("Collected page elements:\n{}", sb.toString());
             return sb.toString();
@@ -284,27 +232,50 @@ public class SeleniumBrowserAutomationService implements BrowserAutomationServic
         }
     }
 
+    /**
+     * 检测页面上的验证码/短文本内容。
+     * 通过 TreeWalker 遍历所有文本节点，筛选 2-8 位纯字母数字的短文本，
+     * 这些很可能是验证码图片旁显示的文字。
+     */
+    private void collectCaptchaText(WebDriver driver, StringBuilder sb) {
+        try {
+            Object captchaResult = ((JavascriptExecutor) driver).executeScript(
+                "var results=[];var w=document.createTreeWalker(document.body,NodeFilter.SHOW_TEXT,null,false);" +
+                "var n;while(n=w.nextNode()){var t=n.textContent.trim();" +
+                "if(t.length>=2&&t.length<=8&&/^[A-Za-z0-9]+$/.test(t)){" +
+                "var e=n.parentElement;if(e&&e.offsetParent!==null){" +
+                "results.push('<'+e.tagName.toLowerCase()+'> text=\"'+t+'\"');}}}return results;"
+            );
+            if (captchaResult instanceof List && !((List<?>) captchaResult).isEmpty()) {
+                sb.append("\n页面上的验证码/短文本内容：\n");
+                @SuppressWarnings("unchecked")
+                List<String> captchaTexts = (List<String>) captchaResult;
+                int count = 0;
+                for (String captchaText : captchaTexts) {
+                    if (count >= 20) break;
+                    sb.append("- ").append(captchaText).append("\n");
+                    count++;
+                }
+            }
+        } catch (Exception e) {
+            log.warn("Failed to detect captcha text via JS: {}", e.getMessage());
+        }
+    }
+
+    /** 安全地将 Object 转为 String，null 返回空字符串 */
     private String str(Object o) {
         return o != null ? o.toString() : "";
     }
 
-    private String safeGetAttr(WebElement el, String attr) {
-        try {
-            String v = el.getAttribute(attr);
-            return v != null ? v : "";
-        } catch (Exception e) { return ""; }
-    }
-
-    private String safeGetText(WebElement el) {
-        try {
-            String t = el.getText();
-            if (t == null || t.trim().isEmpty()) t = el.getAttribute("value");
-            if (t == null) return "";
-            t = t.trim();
-            return t.length() > 80 ? t.substring(0, 80) + "..." : t;
-        } catch (Exception e) { return ""; }
-    }
-
+    /**
+     * 创建浏览器驱动。
+     * 优先创建请求的浏览器类型，失败时自动降级到另一种（Edge → Chrome 或 Chrome → Edge）。
+     *
+     * @param browserName 浏览器类型（EDGE / CHROME）
+     * @param visual      是否可视化模式（false = 无头模式）
+     * @return WebDriver 实例
+     * @throws IllegalStateException 两种浏览器都无法启动时抛出
+     */
     private WebDriver createDriver(String browserName, boolean visual) {
         String requested = (browserName == null || browserName.isBlank()) ? "EDGE" : browserName.toUpperCase();
         String fallback = "EDGE".equals(requested) ? "CHROME" : "EDGE";
@@ -313,12 +284,7 @@ public class SeleniumBrowserAutomationService implements BrowserAutomationServic
         for (String candidate : new String[]{requested, fallback}) {
             try {
                 log.info("Trying to start {} driver...", candidate);
-                WebDriver driver;
-                if ("EDGE".equals(candidate)) {
-                    driver = createEdgeDriver(visual);
-                } else {
-                    driver = createChromeDriver(visual);
-                }
+                WebDriver driver = "EDGE".equals(candidate) ? createEdgeDriver(visual) : createChromeDriver(visual);
                 log.info("{} driver started successfully", candidate);
                 return driver;
             } catch (Exception ex) {
@@ -333,15 +299,13 @@ public class SeleniumBrowserAutomationService implements BrowserAutomationServic
                         ". Please install Microsoft Edge or Google Chrome.", lastError);
     }
 
+    /** 创建 Edge 驱动（支持可视化/无头模式） */
     private WebDriver createEdgeDriver(boolean visual) {
         EdgeOptions options = new EdgeOptions();
         if (!visual) {
             options.addArguments("--headless=new");
         }
-        options.addArguments("--disable-gpu");
-        options.addArguments("--no-sandbox");
-        options.addArguments("--disable-dev-shm-usage");
-        options.addArguments("--remote-allow-origins=*");
+        options.addArguments("--disable-gpu", "--no-sandbox", "--disable-dev-shm-usage", "--remote-allow-origins=*");
 
         String binary = locateBrowserBinary("EDGE");
         if (binary != null) {
@@ -351,15 +315,13 @@ public class SeleniumBrowserAutomationService implements BrowserAutomationServic
         return new EdgeDriver(options);
     }
 
+    /** 创建 Chrome 驱动（支持可视化/无头模式） */
     private WebDriver createChromeDriver(boolean visual) {
         ChromeOptions options = new ChromeOptions();
         if (!visual) {
             options.addArguments("--headless=new");
         }
-        options.addArguments("--disable-gpu");
-        options.addArguments("--no-sandbox");
-        options.addArguments("--disable-dev-shm-usage");
-        options.addArguments("--remote-allow-origins=*");
+        options.addArguments("--disable-gpu", "--no-sandbox", "--disable-dev-shm-usage", "--remote-allow-origins=*");
 
         String binary = locateBrowserBinary("CHROME");
         if (binary != null) {
@@ -369,6 +331,10 @@ public class SeleniumBrowserAutomationService implements BrowserAutomationServic
         return new ChromeDriver(options);
     }
 
+    /**
+     * 查找浏览器可执行文件路径。
+     * 查找优先级：系统属性 > 环境变量 > 默认安装路径。
+     */
     private String locateBrowserBinary(String browserName) {
         if ("CHROME".equalsIgnoreCase(browserName)) {
             String sysProp = System.getProperty("webdriver.chrome.bin");
@@ -392,6 +358,7 @@ public class SeleniumBrowserAutomationService implements BrowserAutomationServic
         return null;
     }
 
+    /** 检查文件路径是否存在，返回第一个存在的路径 */
     private String findExisting(String... candidates) {
         for (String c : candidates) {
             if (c != null && !c.isBlank() && Files.exists(Paths.get(c))) {
@@ -401,6 +368,10 @@ public class SeleniumBrowserAutomationService implements BrowserAutomationServic
         return null;
     }
 
+    /**
+     * 执行单个测试动作（预生成计划模式）。
+     * 支持 NAVIGATE / CLICK / TYPE / ASSERT_TEXT / WAIT / EXECUTE_JS 六种动作类型。
+     */
     private TestStepResult executeAction(WebDriver driver, TestAction action) {
         String description;
         try {
@@ -409,26 +380,20 @@ public class SeleniumBrowserAutomationService implements BrowserAutomationServic
                 case NAVIGATE:
                     String url = String.valueOf(action.getParameters().get("url"));
                     driver.get(url);
-                    try {
-                        Thread.sleep(2000);
-                    } catch (InterruptedException e) {
-                        Thread.currentThread().interrupt();
-                    }
+                    sleep(2000);
                     description = "Navigate to " + url;
                     break;
                 case CLICK:
                     WebElement clickElement = findElement(driver, action);
                     clickElement.click();
-                    Object clickIndex = action.getParameters().get("index");
-                    description = "Click element (index=" + clickIndex + ")";
+                    description = "Click element (index=" + action.getParameters().get("index") + ")";
                     break;
                 case TYPE:
                     WebElement typeElement = findElement(driver, action);
                     Object text = action.getParameters().get("text");
                     typeElement.clear();
                     typeElement.sendKeys(text == null ? "" : String.valueOf(text));
-                    Object typeIndex = action.getParameters().get("index");
-                    description = "Type into element (index=" + typeIndex + "): " + text;
+                    description = "Type into element (index=" + action.getParameters().get("index") + "): " + text;
                     break;
                 case ASSERT_TEXT:
                     WebElement assertElement = findElement(driver, action);
@@ -438,29 +403,11 @@ public class SeleniumBrowserAutomationService implements BrowserAutomationServic
                     if (!actualText.contains(expectedText)) {
                         throw new IllegalStateException("Assertion failed for element (index=" + action.getParameters().get("index") + "): expected [" + expectedText + "] but found [" + actualText + "]");
                     }
-                    Object assertIndex = action.getParameters().get("index");
-                    description = "Assert text contains " + expectedText + " for element (index=" + assertIndex + ")";
+                    description = "Assert text contains " + expectedText + " for element (index=" + action.getParameters().get("index") + ")";
                     break;
                 case WAIT:
-                    Object waitMsValue = action.getParameters().get("ms");
-                    Object secondsValue = action.getParameters().get("seconds");
-                    long sleepMillis;
-                    if (waitMsValue instanceof Number) {
-                        sleepMillis = ((Number) waitMsValue).longValue();
-                    } else if (waitMsValue != null) {
-                        sleepMillis = Long.parseLong(String.valueOf(waitMsValue));
-                    } else if (secondsValue instanceof Number) {
-                        sleepMillis = ((Number) secondsValue).longValue() * 1000L;
-                    } else if (secondsValue != null) {
-                        sleepMillis = Long.parseLong(String.valueOf(secondsValue)) * 1000L;
-                    } else {
-                        sleepMillis = 1000L;
-                    }
-                    try {
-                        Thread.sleep(sleepMillis);
-                    } catch (InterruptedException e) {
-                        Thread.currentThread().interrupt();
-                    }
+                    long sleepMillis = resolveWaitMillis(action);
+                    sleep(sleepMillis);
                     description = "Wait for " + sleepMillis + " ms";
                     break;
                 case EXECUTE_JS:
@@ -479,19 +426,33 @@ public class SeleniumBrowserAutomationService implements BrowserAutomationServic
         }
     }
 
+    /** 解析 WAIT 动作的等待时间，支持 ms 和 seconds 两种参数 */
+    private long resolveWaitMillis(TestAction action) {
+        Object waitMsValue = action.getParameters().get("ms");
+        Object secondsValue = action.getParameters().get("seconds");
+        if (waitMsValue instanceof Number) return ((Number) waitMsValue).longValue();
+        if (waitMsValue != null) return Long.parseLong(String.valueOf(waitMsValue));
+        if (secondsValue instanceof Number) return ((Number) secondsValue).longValue() * 1000L;
+        if (secondsValue != null) return Long.parseLong(String.valueOf(secondsValue)) * 1000L;
+        return 1000L;
+    }
+
+    /** 截取当前页面截图，返回 base64 编码的 data URI */
     private String captureScreenshot(WebDriver driver) {
         try {
             if (driver instanceof TakesScreenshot takesScreenshot) {
-                String base64 = takesScreenshot.getScreenshotAs(OutputType.BASE64);
-                return "data:image/png;base64," + base64;
+                return "data:image/png;base64," + takesScreenshot.getScreenshotAs(OutputType.BASE64);
             }
         } catch (Exception ignored) {
         }
         return null;
     }
 
+    /**
+     * 根据 TestAction 定位页面元素。
+     * 优先使用 index 编号定位，fallback 到 selector（xpath/text=/cssSelector）。
+     */
     private WebElement findElement(WebDriver driver, TestAction action) {
-        // 优先使用 index 参数（LLM 智能定位）
         Object indexObj = action.getParameters().get("index");
         if (indexObj instanceof Number) {
             int index = ((Number) indexObj).intValue();
@@ -499,68 +460,36 @@ public class SeleniumBrowserAutomationService implements BrowserAutomationServic
         }
         
         String selector = String.valueOf(action.getParameters().get("selector"));
-        if (selector == null || selector.isEmpty()) {
-            throw new IllegalArgumentException("Selector or index must be provided");
+        if (selector == null || selector.isEmpty() || "null".equals(selector)) {
+            throw new IllegalArgumentException("Index must be provided for element location");
         }
         selector = selector.trim();
 
-        if (selector.startsWith("//") || selector.startsWith("(.") || selector.startsWith("xpath=")) {
+        if (selector.startsWith("//") || selector.startsWith("xpath=")) {
             String xpath = selector.startsWith("xpath=") ? selector.substring("xpath=".length()) : selector;
             return driver.findElement(By.xpath(xpath));
         }
 
         if (selector.toLowerCase().startsWith("text=")) {
             String text = selector.substring(5).trim();
-            String xpath = "//*[contains(normalize-space(string(.)), '" + escapeXPathText(text) + "')]";
-            return driver.findElement(By.xpath(xpath));
-        }
-
-        if (selector.matches("(?i)^.+:has-text\\(['\"].+['\"]\\)$")) {
-            int idx = selector.indexOf(":has-text(");
-            String tag = selector.substring(0, idx).trim();
-            String text = selector.substring(idx + 10, selector.length() - 1).trim();
-            if ((text.startsWith("'") && text.endsWith("'")) || (text.startsWith("\"") && text.endsWith("\""))) {
-                text = text.substring(1, text.length() - 1);
-            }
-            String xpath = "//" + tag + "[contains(normalize-space(string(.)), '" + escapeXPathText(text) + "')]";
-            return driver.findElement(By.xpath(xpath));
-        }
-
-        // 支持 jQuery 风格的 :contains() 伪类选择器，例如：button:contains('登录')
-        if (selector.contains(":contains(")) {
-            int idx = selector.indexOf(":contains(");
-            String tag = selector.substring(0, idx).trim();
-            String text = selector.substring(idx + 10, selector.length() - 1).trim();
-            if ((text.startsWith("'") && text.endsWith("'")) || (text.startsWith("\"") && text.endsWith("\""))) {
-                text = text.substring(1, text.length() - 1);
-            }
-            String xpath = "//" + tag + "[contains(normalize-space(string(.)), '" + escapeXPathText(text) + "')]";
-            log.info("Converted :contains() selector to XPath: {}", xpath);
-            return driver.findElement(By.xpath(xpath));
+            return driver.findElement(By.xpath("//*[contains(normalize-space(string(.)), '" + escapeXPathText(text) + "')]"));
         }
 
         return driver.findElement(By.cssSelector(selector));
     }
 
     /**
-     * 根据 DOM 元素索引定位元素（从0开始计数）
-     * 只匹配可交互元素：input, select, textarea, button, a
+     * 通过元素编号定位元素（预生成计划模式专用）。
+     * 重新执行 JS_COLLECT 获取最新元素列表，然后根据目标元素的属性组合构建 CSS 选择器查找。
+     * 查找策略：CSS 属性组合 → 文本内容 XPath → 属性精确匹配 → 位置匹配。
      */
     private WebElement findElementByIndex(WebDriver driver, int index) {
         @SuppressWarnings("unchecked")
         List<Map<String, Object>> jsResults = (List<Map<String, Object>>)
                 ((JavascriptExecutor) driver).executeScript(JS_COLLECT);
 
-        log.info("JS detected {} interactive elements on page", jsResults.size());
-        for (int i = 0; i < jsResults.size(); i++) {
-            Map<String, Object> item = jsResults.get(i);
-            log.info("  [{}] <{}> text=\"{}\" id={} name={}",
-                i, item.get("tag"), item.get("text"), item.get("id"), item.get("name"));
-        }
-
         if (index < 0 || index >= jsResults.size()) {
-            throw new NoSuchElementException("Element index " + index + " out of range [0, " + jsResults.size() + "). " +
-                "Available interactive elements: " + jsResults.size());
+            throw new NoSuchElementException("Element index " + index + " out of range [0, " + jsResults.size() + ")");
         }
 
         Map<String, Object> target = jsResults.get(index);
@@ -571,6 +500,7 @@ public class SeleniumBrowserAutomationService implements BrowserAutomationServic
         String type = (String) target.get("type");
         String placeholder = (String) target.get("ph");
 
+        // 策略1：通过 CSS 属性组合选择器查找
         StringBuilder cssBuilder = new StringBuilder(tag);
         if (!id.isEmpty()) cssBuilder.append("#").append(id);
         if (!name.isEmpty()) cssBuilder.append("[name='").append(name).append("']");
@@ -578,17 +508,16 @@ public class SeleniumBrowserAutomationService implements BrowserAutomationServic
         if (!placeholder.isEmpty()) cssBuilder.append("[placeholder='").append(placeholder).append("']");
 
         List<WebElement> candidates = driver.findElements(By.cssSelector(cssBuilder.toString()));
-        if (!candidates.isEmpty()) {
-            for (WebElement c : candidates) {
-                try {
-                    if (c.isDisplayed()) {
-                        log.info("Found element at index {} by CSS: {}", index, cssBuilder);
-                        return c;
-                    }
-                } catch (Exception ignored) {}
-            }
+        for (WebElement c : candidates) {
+            try {
+                if (c.isDisplayed()) {
+                    log.info("Found element at index {} by CSS: {}", index, cssBuilder);
+                    return c;
+                }
+            } catch (Exception ignored) {}
         }
 
+        // 策略2：通过文本内容 XPath 查找
         if (!text.isEmpty()) {
             String xpath = "//*[contains(normalize-space(string(.)), '" + escapeXPathText(text) + "')]";
             try {
@@ -600,6 +529,7 @@ public class SeleniumBrowserAutomationService implements BrowserAutomationServic
             } catch (Exception ignored) {}
         }
 
+        // 策略3：通过属性精确匹配查找
         List<WebElement> allOfTag = driver.findElements(By.cssSelector(tag));
         for (WebElement el : allOfTag) {
             try {
@@ -616,6 +546,7 @@ public class SeleniumBrowserAutomationService implements BrowserAutomationServic
             } catch (Exception ignored) {}
         }
 
+        // 策略4：位置匹配（兜底）
         int posIdx = 0;
         for (WebElement el : allOfTag) {
             try {
@@ -633,54 +564,60 @@ public class SeleniumBrowserAutomationService implements BrowserAutomationServic
             ". Target: <" + tag + "> text=\"" + text + "\" id=\"" + id + "\"");
     }
 
+    /** 转义 XPath 文本中的单引号（使用 concat 函数） */
     private String escapeXPathText(String text) {
-        if (!text.contains("'")) {
-            return text;
-        }
-        if (!text.contains("\"")) {
-            return text;
-        }
+        if (!text.contains("'")) return text;
+        if (!text.contains("\"")) return text;
         String[] parts = text.split("'");
         StringBuilder builder = new StringBuilder("concat(");
         for (int i = 0; i < parts.length; i++) {
-            if (i > 0) {
-                builder.append(", '\'', ");
-            }
+            if (i > 0) builder.append(", '\'', ");
             builder.append('"').append(parts[i]).append('"');
         }
         builder.append(")");
         return builder.toString();
     }
 
+    /** Agent Loop 模式入口（无 SSE），委托给 runAgentLoopWithSse */
     @Override
     public AgentLoopResult runAgentLoop(String targetUrl, String taskDescription, String browserName, boolean visual) {
-        return runAgentLoopWithSession(targetUrl, taskDescription, browserName, visual, null);
+        return runAgentLoopWithSse(targetUrl, taskDescription, browserName, visual, null, null, null);
     }
 
-    public AgentLoopResult runAgentLoopWithSession(String targetUrl, String taskDescription,
-                                                    String browserName, boolean visual, String taskId) {
-        return runAgentLoopWithSession(targetUrl, taskDescription, browserName, visual, taskId, null);
-    }
-
-    public AgentLoopResult runAgentLoopWithSession(String targetUrl, String taskDescription,
-                                                    String browserName, boolean visual, String taskId,
-                                                    AgentLoopCallback callback) {
-        return runAgentLoopWithSse(targetUrl, taskDescription, browserName, visual, taskId, callback, null);
-    }
-
+    /**
+     * Agent Loop 模式核心执行方法（带 SSE 推送和暂停/恢复支持）。
+     *
+     * 执行流程：
+     * <ol>
+     *   <li>创建浏览器驱动并导航到目标页面</li>
+     *   <li>调用 AgentLoopService.run() 启动 Agent Loop</li>
+     *   <li>如果 LLM 返回 needs_input → 保存 Session，阻塞等待用户输入</li>
+     *   <li>收到用户输入后调用 AgentLoopService.resumeFromSession() 恢复执行</li>
+     *   <li>支持多次暂停（while 循环），直到任务完成或超时</li>
+     *   <li>任务完成/失败后关闭浏览器（needs_input 暂停时保持浏览器打开）</li>
+     * </ol>
+     *
+     * @param targetUrl      目标页面 URL
+     * @param taskDescription 自然语言任务描述
+     * @param browserName    浏览器类型
+     * @param visual         是否可视化模式
+     * @param taskId         任务 ID（用于 Session 管理）
+     * @param callback       暂停时的回调通知
+     * @param emitter        SSE 发射器（用于实时推送进度）
+     * @return Agent Loop 执行结果
+     */
     public AgentLoopResult runAgentLoopWithSse(String targetUrl, String taskDescription,
                                                 String browserName, boolean visual, String taskId,
                                                 AgentLoopCallback callback,
-                                                org.springframework.web.servlet.mvc.method.annotation.SseEmitter emitter) {
+                                                SseEmitter emitter) {
         WebDriver driver = null;
         boolean keepDriverOpen = false;
         
+        // 尝试从已有 Session 中恢复 SSE emitter
         if (emitter == null && taskId != null) {
-            log.warn("Emitter is null for task {}, attempting to retrieve from session", taskId);
             AgentSession session = activeSessions.get(taskId);
             if (session != null && session.getEmitter() != null) {
                 emitter = session.getEmitter();
-                log.info("Retrieved emitter from session for task {}", taskId);
             }
         }
         
@@ -688,10 +625,12 @@ public class SeleniumBrowserAutomationService implements BrowserAutomationServic
             driver = createDriver(browserName, visual);
             driver.manage().timeouts().implicitlyWait(Duration.ofSeconds(5));
             driver.get(targetUrl);
-            try { Thread.sleep(2000); } catch (InterruptedException e) { Thread.currentThread().interrupt(); }
+            sleep(2000);
 
+            // 启动 Agent Loop
             AgentLoopResult loopResult = agentLoopService.run(driver, targetUrl, taskDescription, taskId, emitter);
 
+            // 处理 needs_input 暂停场景
             if (loopResult.getNeedsInputPrompt() != null && taskId != null) {
                 keepDriverOpen = true;
                 log.info("Agent needs input for task {}, keeping browser open", taskId);
@@ -705,6 +644,7 @@ public class SeleniumBrowserAutomationService implements BrowserAutomationServic
                     callback.onNeedsInput(loopResult);
                 }
 
+                // 阻塞等待用户输入（最长 5 分钟）
                 try {
                     boolean gotInput = session.waitForInput(300000);
                     if (!gotInput) {
@@ -724,10 +664,8 @@ public class SeleniumBrowserAutomationService implements BrowserAutomationServic
 
                 log.info("User provided input for task {}, resuming", taskId);
                 
-                // 从 session 获取最新的 emitter（可能在前端重新连接时被更新）
-                org.springframework.web.servlet.mvc.method.annotation.SseEmitter resumeEmitter = session.getEmitter();
-                log.info("Resume emitter from session: {}", resumeEmitter != null ? "valid" : "null");
-                
+                // 恢复执行，支持多次暂停循环
+                SseEmitter resumeEmitter = session.getEmitter();
                 AgentLoopResult resumeResult = agentLoopService.resumeFromSession(session, resumeEmitter);
 
                 while (resumeResult.getNeedsInputPrompt() != null) {
@@ -753,9 +691,7 @@ public class SeleniumBrowserAutomationService implements BrowserAutomationServic
                         return resumeResult;
                     }
                     
-                    // 每次恢复执行前都更新 emitter
                     resumeEmitter = session.getEmitter();
-                    log.info("Resume emitter for next iteration: {}", resumeEmitter != null ? "valid" : "null");
                     resumeResult = agentLoopService.resumeFromSession(session, resumeEmitter);
                 }
 
@@ -770,10 +706,7 @@ public class SeleniumBrowserAutomationService implements BrowserAutomationServic
             AgentLoopResult err = new AgentLoopResult();
             err.setSuccess(false);
             err.setMessage("Agent loop crashed: " + ex.getMessage());
-            java.io.StringWriter sw = new java.io.StringWriter();
-            java.io.PrintWriter pw = new java.io.PrintWriter(sw);
-            ex.printStackTrace(pw);
-            err.setDetails(sw.toString());
+            err.setDetails(getStackTrace(ex));
             return err;
         } finally {
             if (driver != null && !keepDriverOpen) {
@@ -782,36 +715,20 @@ public class SeleniumBrowserAutomationService implements BrowserAutomationServic
         }
     }
 
-    private List<TestStepResult> convertAgentStepsToTestSteps(List<com.gao.agent.model.AgentStepResult> agentSteps) {
-        if (agentSteps == null || agentSteps.isEmpty()) {
-            return new ArrayList<>();
-        }
-        List<TestStepResult> testSteps = new ArrayList<>();
-        for (com.gao.agent.model.AgentStepResult agentStep : agentSteps) {
-            TestStepResult testStep = new TestStepResult();
-            
-            String actionName = agentStep.getAction() != null ? agentStep.getAction().getAction().name() : "unknown";
-            String summary = agentStep.getAction() != null ? agentStep.getAction().getSummary() : null;
-            
-            StringBuilder description = new StringBuilder();
-            description.append("[").append(agentStep.getStepNumber()).append("] ").append(actionName);
-            if (summary != null && !summary.isEmpty()) {
-                description.append(" - ").append(summary);
-            }
-            testStep.setDescription(description.toString());
-            
-            testStep.setSuccess(agentStep.isSuccess());
-            testStep.setScreenshotBase64(agentStep.getScreenshot());
-            
-            if (!agentStep.isSuccess() && agentStep.getMessage() != null) {
-                testStep.setDetails("错误: " + agentStep.getMessage());
-            }
-            
-            testSteps.add(testStep);
-        }
-        return testSteps;
+    /** 线程休眠，捕获 InterruptedException 并恢复中断标志 */
+    private void sleep(long ms) {
+        try { Thread.sleep(ms); } catch (InterruptedException e) { Thread.currentThread().interrupt(); }
     }
 
+    /** 获取异常堆栈字符串 */
+    private String getStackTrace(Exception ex) {
+        java.io.StringWriter sw = new java.io.StringWriter();
+        java.io.PrintWriter pw = new java.io.PrintWriter(sw);
+        ex.printStackTrace(pw);
+        return sw.toString();
+    }
+
+    /** 关闭指定任务的 Session，释放浏览器驱动资源 */
     public void closeSession(String taskId) {
         AgentSession session = activeSessions.remove(taskId);
         if (session != null) {
@@ -819,6 +736,7 @@ public class SeleniumBrowserAutomationService implements BrowserAutomationServic
         }
     }
 
+    /** 获取指定任务的 Session（用于外部查询暂停状态） */
     public AgentSession getSession(String taskId) {
         return activeSessions.get(taskId);
     }
