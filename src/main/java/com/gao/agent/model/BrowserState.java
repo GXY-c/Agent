@@ -92,6 +92,14 @@ public class BrowserState {
         private String role;
         /** 链接 href 属性（仅 a 标签） */
         private String href;
+        /** 元素相对于 viewport 的 X 坐标（像素），用于前端截图高亮标注 */
+        private int x;
+        /** 元素相对于 viewport 的 Y 坐标（像素） */
+        private int y;
+        /** 元素宽度（像素） */
+        private int width;
+        /** 元素高度（像素） */
+        private int height;
 
         public String getTag() { return tag; }
         public void setTag(String tag) { this.tag = tag; }
@@ -111,5 +119,13 @@ public class BrowserState {
         public void setRole(String role) { this.role = role; }
         public String getHref() { return href; }
         public void setHref(String href) { this.href = href; }
+        public int getX() { return x; }
+        public void setX(int x) { this.x = x; }
+        public int getY() { return y; }
+        public void setY(int y) { this.y = y; }
+        public int getWidth() { return width; }
+        public void setWidth(int width) { this.width = width; }
+        public int getHeight() { return height; }
+        public void setHeight(int height) { this.height = height; }
     }
 }

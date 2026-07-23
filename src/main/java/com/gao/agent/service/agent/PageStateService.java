@@ -113,7 +113,8 @@ public class PageStateService {
         "R.push({tag:t,text:tx,type:c.getAttribute('type')||'',name:c.getAttribute('name')||''," +
         "id:c.getAttribute('id')||'',ph:c.getAttribute('placeholder')||''," +
         "al:c.getAttribute('aria-label')||'',role:c.getAttribute('role')||''," +
-        "href:c.getAttribute('href')||'',cls:(c.className&&typeof c.className==='string'?c.className:'').split(' ').slice(0,3).join(' ')});" +
+        "href:c.getAttribute('href')||'',cls:(c.className&&typeof c.className==='string'?c.className:'').split(' ').slice(0,3).join(' ')," +
+        "x:Math.round(r.x),y:Math.round(r.y),w:Math.round(r.width),h:Math.round(r.height)});" +
         "window.__agentEls.push(c);}}" +
         "walk(c);}}" +
         "walk(document.body);return R;";
@@ -161,6 +162,10 @@ public class PageStateService {
                     String ariaLabel = str(item.get("al"));
                     String role = str(item.get("role"));
                     String href = str(item.get("href"));
+                    int ex = intVal(item.get("x"));
+                    int ey = intVal(item.get("y"));
+                    int ew = intVal(item.get("w"));
+                    int eh = intVal(item.get("h"));
 
                     BrowserState.ElementInfo info = new BrowserState.ElementInfo();
                     info.setTag(tag);
@@ -172,6 +177,10 @@ public class PageStateService {
                     info.setAriaLabel(ariaLabel);
                     info.setRole(role);
                     info.setHref(href);
+                    info.setX(ex);
+                    info.setY(ey);
+                    info.setWidth(ew);
+                    info.setHeight(eh);
                     selectorMap.put(idx, info);
 
                     // 生成面向 LLM 的元素描述文本
@@ -247,6 +256,14 @@ public class PageStateService {
                 info.setAriaLabel(ariaLabel);
                 info.setRole(role);
                 info.setHref(href);
+                try {
+                    org.openqa.selenium.Point loc = el.getLocation();
+                    org.openqa.selenium.Dimension dim = el.getSize();
+                    info.setX(loc.getX());
+                    info.setY(loc.getY());
+                    info.setWidth(dim.getWidth());
+                    info.setHeight(dim.getHeight());
+                } catch (Exception ignored) {}
                 selectorMap.put(idx, info);
                 state.putElement(idx, el);
 
@@ -267,6 +284,13 @@ public class PageStateService {
 
     /** 安全地将 Object 转为 String，null 返回空字符串 */
     private String str(Object o) { return o != null ? o.toString() : ""; }
+
+    /** 安全地将 Object 转为 int，null 或非数字返回 0 */
+    private int intVal(Object o) {
+        if (o == null) return 0;
+        if (o instanceof Number n) return n.intValue();
+        try { return Integer.parseInt(o.toString()); } catch (Exception e) { return 0; }
+    }
 
     /** 安全地获取 WebElement 属性值，异常时返回空字符串 */
     private String safeAttr(WebElement el, String attr) {

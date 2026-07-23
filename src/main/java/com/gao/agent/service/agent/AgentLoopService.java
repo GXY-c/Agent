@@ -67,7 +67,9 @@ public class AgentLoopService {
         this.llmService = llmService;
     }
 
-    /** 启动 Agent Loop（无 SSE 推送的简化版本） */
+    /**
+     * 启动 Agent Loop（无 SSE 推送的简化版本）
+     */
     public AgentLoopResult run(WebDriver driver, String targetUrl, String taskDescription) {
         return run(driver, targetUrl, taskDescription, null, null);
     }
@@ -297,7 +299,9 @@ public class AgentLoopService {
             sr.setMessage(ar.message());
             steps.add(sr);
 
-            sendSse(emitter, AgentStreamEvent.actionComplete(taskId, step, ar.success(), ar.message()));
+            String stepScreenshot = sr.getScreenshot();
+            String elementRectJson = buildElementRectJson(action, state);
+            sendSse(emitter, AgentStreamEvent.actionCompleteWithScreenshot(taskId, step, ar.success(), ar.message(), stepScreenshot, elementRectJson));
 
             // ⑤ 等待页面响应
             try { Thread.sleep(waitMs); } catch (InterruptedException e) { Thread.currentThread().interrupt(); break; }
@@ -352,6 +356,20 @@ public class AgentLoopService {
     }
 
     /**
+     * 构建操作元素的坐标矩形 JSON 字符串。
+     * 从 BrowserState.selectorMap 中取出对应 index 的元素坐标，
+     * 返回格式 {"x":0,"y":0,"w":100,"h":30,"index":5}，无坐标时返回 null。
+     */
+    private String buildElementRectJson(AgentAction action, BrowserState state) {
+        if (action.getIndex() == null || state.getSelectorMap() == null) return null;
+        BrowserState.ElementInfo info = state.getSelectorMap().get(action.getIndex());
+        if (info == null) return null;
+        return "{\"x\":" + info.getX() + ",\"y\":" + info.getY() +
+               ",\"w\":" + info.getWidth() + ",\"h\":" + info.getHeight() +
+               ",\"index\":" + action.getIndex() + "}";
+    }
+
+    /**
      * 发送 SSE 事件到前端。
      * 自动处理 emitter 为 null 和发送失败的情况，不会抛出异常中断 Agent Loop。
      */
@@ -401,14 +419,16 @@ public class AgentLoopService {
         }
 
         sr.setSuccess(taskSuccess);
-        sr.setMessage((taskSuccess ? "✅ 完成: " : "❌ 未完成: ") +
-                (action.getSummary() != null ? action.getSummary() : "任务结束"));
+        String summary = action.getSummary() != null && !action.getSummary().isEmpty() 
+                ? action.getSummary() 
+                : (taskSuccess ? "任务已完成" : "任务结束");
+        sr.setMessage((taskSuccess ? "✅ 完成: " : "❌ 未完成: ") + summary);
         steps.add(sr);
 
         AgentLoopResult result = new AgentLoopResult();
         result.setSuccess(taskSuccess);
         result.setSummary(action.getSummary());
-        result.setMessage((taskSuccess ? "任务成功" : "任务未完成") + "，共 " + steps.size() + " 步");
+        result.setMessage((taskSuccess ? "任务成功" : "任务未完成") + "，共 " + steps.size() + " 步。原因：" + summary);
         result.setSteps(steps);
         return result;
     }
@@ -516,7 +536,7 @@ public class AgentLoopService {
      * 以及关于 done 动作的关键约束（必须有页面证据才能标记成功）。
      */
     static final String SYSTEM_PROMPT = """
-你是一个浏览器自动化 AI Agent。你需要逐步操作网页来完成用户的任务。
+你是一个自动测试前端UI组件Agent。你需要逐步操作网页来完成用户的任务。
 
 每一步你会收到：当前页面的可交互元素列表。你需要返回一个 JSON 对象，包含下一步要执行的一个动作。
 
@@ -543,9 +563,17 @@ public class AgentLoopService {
 8. 只有当页面元素列表中出现了明确的"任务已完成"证据时，才能返回 done + success=true。
    - 例如：任务要求登录，则必须在页面元素中看到"退出"、"个人中心"、"欢迎"等登录后的标志性元素。
    - 例如：任务要求搜索，则必须在页面元素中看到搜索结果列表。
+   - **重要：如果任务包含多个步骤（如"登录并找到XXX"），必须完成所有步骤！**
+     * "登录并找到张三的个人能力评价" = 先登录 + 再导航到张三的评价页面 + 确认页面上显示"张三"的信息
+     * 仅登录成功是不够的，必须继续操作直到看到目标内容
 9. 严禁假设操作成功！如果上一步操作的结果不明确，先用 wait 等待，然后检查页面元素是否变化。
 10. 如果当前页面元素与操作前相比没有明显变化，说明操作可能未生效，应尝试其他方法。
 11. done 的 summary 必须简洁，不超过 100 字！必须基于页面中实际看到的元素来描述结果。
+    - **必须明确指出看到了什么证据证明任务完成**（如"页面标题显示'张三的个人能力评价'"）
+12. **遇到错误提示（如"用户不存在"、"密码错误"、"登录失败"等）时，不要直接返回 done！**
+    - 应该先检查是否填错了信息（如账号、密码）
+    - 如果确认信息正确但仍失败，返回 needs_input 让用户确认
+    - 只有在尝试所有可能方法后仍无法完成时，才返回 done + success=false
 
 ## 输出格式（纯 JSON，不要代码块）
 {"action": "click_element", "index": 0, "thinking": "思考过程"}

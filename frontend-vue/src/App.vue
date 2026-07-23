@@ -57,6 +57,7 @@
 
       <section class="right-panel">
         <div class="chat-panel-full">
+          <TimelineBar :steps="steps" />
           <div class="chat-header">
             <h2> AI 思考过程</h2>
             <span v-if="status" class="status-badge" :class="statusClass">{{ statusText }}</span>
@@ -94,7 +95,13 @@
                   </div>
                   <div class="message-text">{{ step.content }}</div>
                   <div v-if="step.details" class="message-details">{{ step.details }}</div>
-                  <div v-if="step.screenshot" class="screenshot-container">
+                  <StepScreenshot
+                    v-if="step.screenshot && step.type === 'result'"
+                    :screenshot="step.screenshot"
+                    :element-rect="step.elementRect"
+                    @preview="openScreenshot"
+                  />
+                  <div v-if="step.screenshot && step.type === 'done'" class="screenshot-container">
                     <p class="screenshot-label">📸 最终页面截图</p>
                     <img :src="step.screenshot" class="screenshot-img" @click="openScreenshot(step.screenshot)" />
                   </div>
@@ -121,6 +128,7 @@
             </div>
           </div>
         </div>
+        <SseLogPanel :logs="sseLogs" />
       </section>
     </main>
 
@@ -133,6 +141,9 @@
 <script setup>
 import { ref, computed, nextTick, onUnmounted } from 'vue';
 import axios from 'axios';
+import StepScreenshot from './components/StepScreenshot.vue';
+import TimelineBar from './components/TimelineBar.vue';
+import SseLogPanel from './components/SseLogPanel.vue';
 
 const targetUrl = ref('http://localhost:5173/login');
 const taskDescription = ref('');
@@ -147,6 +158,7 @@ const needsInputPrompt = ref('');
 const userInputText = ref('');
 const chatContainer = ref(null);
 const previewScreenshot = ref('');
+const sseLogs = ref([]);
 let pollInterval = null;
 let eventSource = null;
 
@@ -194,6 +206,7 @@ async function submitTask() {
   status.value = 'PENDING';
   taskMessage.value = '正在生成测试计划...';
   steps.value = [];
+  sseLogs.value = [];
   needsInputPrompt.value = '';
   userInputText.value = '';
 
@@ -232,36 +245,42 @@ function connectToStream(taskId) {
 
   eventSource.addEventListener('thinking', (event) => {
     const data = JSON.parse(event.data);
+    appendLog('thinking', data);
     console.log('✅ Received thinking event:', data);
     addThinkingStep(data);
   });
 
   eventSource.addEventListener('action_start', (event) => {
     const data = JSON.parse(event.data);
+    appendLog('action_start', data);
     console.log('✅ Received action_start event:', data);
     addActionStep(data);
   });
 
   eventSource.addEventListener('action_complete', (event) => {
     const data = JSON.parse(event.data);
+    appendLog('action_complete', data);
     console.log('✅ Received action_complete event:', data);
     updateLastStepResult(data);
   });
 
   eventSource.addEventListener('needs_input', (event) => {
     const data = JSON.parse(event.data);
+    appendLog('needs_input', data);
     console.log('✅ Received needs_input event:', data);
     addNeedsInputStep(data);
   });
 
   eventSource.addEventListener('done', (event) => {
     const data = JSON.parse(event.data);
+    appendLog('done', data);
     console.log('✅ Received done event:', data);
     addDoneStep(data);
   });
 
   eventSource.addEventListener('error', (event) => {
     const data = JSON.parse(event.data);
+    appendLog('error', data);
     console.log('✅ Received error event:', data);
     addErrorStep(data);
   });
@@ -310,6 +329,8 @@ function updateLastStepResult(data) {
     lastStep.type = 'result';
     lastStep.content = data.content;
     lastStep.success = data.success;
+    lastStep.screenshot = data.screenshot || '';
+    lastStep.elementRect = data.elementRect ? JSON.parse(data.elementRect) : null;
   }
   scrollToBottom();
 }
@@ -377,6 +398,17 @@ function scrollToBottom() {
     if (chatContainer.value) {
       chatContainer.value.scrollTop = chatContainer.value.scrollHeight;
     }
+  });
+}
+
+function appendLog(type, data) {
+  const now = new Date();
+  const time = now.toLocaleTimeString('zh-CN', { hour12: false }) + '.' + String(now.getMilliseconds()).padStart(3, '0');
+  const summary = data.content || data.message || '';
+  sseLogs.value.push({
+    time,
+    type,
+    data: summary.length > 120 ? summary.substring(0, 120) + '...' : summary
   });
 }
 
@@ -460,6 +492,7 @@ function showError(message) {
 function openScreenshot(src) {
   previewScreenshot.value = src;
 }
+
 </script>
 
 <style>
